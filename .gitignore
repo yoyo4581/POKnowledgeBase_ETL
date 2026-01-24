@@ -232,3 +232,6 @@ id_rsa*
 logs/
 node_modules/
 .claude/
+
+# added by merge_versions.py
+data/
