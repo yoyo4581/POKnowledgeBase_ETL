@@ -231,3 +231,4 @@ etl-runner-env/
 id_rsa*
 logs/
 node_modules/
+.claude/
