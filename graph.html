@@ -1,0 +1,349 @@
+<html>
+    <head>
+        <meta charset="utf-8">
+        
+            <script>function neighbourhoodHighlight(params) {
+  // console.log("in nieghbourhoodhighlight");
+  allNodes = nodes.get({ returnType: "Object" });
+  // originalNodes = JSON.parse(JSON.stringify(allNodes));
+  // if something is selected:
+  if (params.nodes.length > 0) {
+    highlightActive = true;
+    var i, j;
+    var selectedNode = params.nodes[0];
+    var degrees = 2;
+
+    // mark all nodes as hard to read.
+    for (let nodeId in allNodes) {
+      // nodeColors[nodeId] = allNodes[nodeId].color;
+      allNodes[nodeId].color = "rgba(200,200,200,0.5)";
+      if (allNodes[nodeId].hiddenLabel === undefined) {
+        allNodes[nodeId].hiddenLabel = allNodes[nodeId].label;
+        allNodes[nodeId].label = undefined;
+      }
+    }
+    var connectedNodes = network.getConnectedNodes(selectedNode);
+    var allConnectedNodes = [];
+
+    // get the second degree nodes
+    for (i = 1; i < degrees; i++) {
+      for (j = 0; j < connectedNodes.length; j++) {
+        allConnectedNodes = allConnectedNodes.concat(
+          network.getConnectedNodes(connectedNodes[j])
+        );
+      }
+    }
+
+    // all second degree nodes get a different color and their label back
+    for (i = 0; i < allConnectedNodes.length; i++) {
+      // allNodes[allConnectedNodes[i]].color = "pink";
+      allNodes[allConnectedNodes[i]].color = "rgba(150,150,150,0.75)";
+      if (allNodes[allConnectedNodes[i]].hiddenLabel !== undefined) {
+        allNodes[allConnectedNodes[i]].label =
+          allNodes[allConnectedNodes[i]].hiddenLabel;
+        allNodes[allConnectedNodes[i]].hiddenLabel = undefined;
+      }
+    }
+
+    // all first degree nodes get their own color and their label back
+    for (i = 0; i < connectedNodes.length; i++) {
+      // allNodes[connectedNodes[i]].color = undefined;
+      allNodes[connectedNodes[i]].color = nodeColors[connectedNodes[i]];
+      if (allNodes[connectedNodes[i]].hiddenLabel !== undefined) {
+        allNodes[connectedNodes[i]].label =
+          allNodes[connectedNodes[i]].hiddenLabel;
+        allNodes[connectedNodes[i]].hiddenLabel = undefined;
+      }
+    }
+
+    // the main node gets its own color and its label back.
+    // allNodes[selectedNode].color = undefined;
+    allNodes[selectedNode].color = nodeColors[selectedNode];
+    if (allNodes[selectedNode].hiddenLabel !== undefined) {
+      allNodes[selectedNode].label = allNodes[selectedNode].hiddenLabel;
+      allNodes[selectedNode].hiddenLabel = undefined;
+    }
+  } else if (highlightActive === true) {
+    // console.log("highlightActive was true");
+    // reset all nodes
+    for (let nodeId in allNodes) {
+      // allNodes[nodeId].color = "purple";
+      allNodes[nodeId].color = nodeColors[nodeId];
+      // delete allNodes[nodeId].color;
+      if (allNodes[nodeId].hiddenLabel !== undefined) {
+        allNodes[nodeId].label = allNodes[nodeId].hiddenLabel;
+        allNodes[nodeId].hiddenLabel = undefined;
+      }
+    }
+    highlightActive = false;
+  }
+
+  // transform the object into an array
+  var updateArray = [];
+  if (params.nodes.length > 0) {
+    for (let nodeId in allNodes) {
+      if (allNodes.hasOwnProperty(nodeId)) {
+        // console.log(allNodes[nodeId]);
+        updateArray.push(allNodes[nodeId]);
+      }
+    }
+    nodes.update(updateArray);
+  } else {
+    // console.log("Nothing was selected");
+    for (let nodeId in allNodes) {
+      if (allNodes.hasOwnProperty(nodeId)) {
+        // console.log(allNodes[nodeId]);
+        // allNodes[nodeId].color = {};
+        updateArray.push(allNodes[nodeId]);
+      }
+    }
+    nodes.update(updateArray);
+  }
+}
+
+function filterHighlight(params) {
+  allNodes = nodes.get({ returnType: "Object" });
+  // if something is selected:
+  if (params.nodes.length > 0) {
+    filterActive = true;
+    let selectedNodes = params.nodes;
+
+    // hiding all nodes and saving the label
+    for (let nodeId in allNodes) {
+      allNodes[nodeId].hidden = true;
+      if (allNodes[nodeId].savedLabel === undefined) {
+        allNodes[nodeId].savedLabel = allNodes[nodeId].label;
+        allNodes[nodeId].label = undefined;
+      }
+    }
+
+    for (let i=0; i < selectedNodes.length; i++) {
+      allNodes[selectedNodes[i]].hidden = false;
+      if (allNodes[selectedNodes[i]].savedLabel !== undefined) {
+        allNodes[selectedNodes[i]].label = allNodes[selectedNodes[i]].savedLabel;
+        allNodes[selectedNodes[i]].savedLabel = undefined;
+      }
+    }
+
+  } else if (filterActive === true) {
+    // reset all nodes
+    for (let nodeId in allNodes) {
+      allNodes[nodeId].hidden = false;
+      if (allNodes[nodeId].savedLabel !== undefined) {
+        allNodes[nodeId].label = allNodes[nodeId].savedLabel;
+        allNodes[nodeId].savedLabel = undefined;
+      }
+    }
+    filterActive = false;
+  }
+
+  // transform the object into an array
+  var updateArray = [];
+  if (params.nodes.length > 0) {
+    for (let nodeId in allNodes) {
+      if (allNodes.hasOwnProperty(nodeId)) {
+        updateArray.push(allNodes[nodeId]);
+      }
+    }
+    nodes.update(updateArray);
+  } else {
+    for (let nodeId in allNodes) {
+      if (allNodes.hasOwnProperty(nodeId)) {
+        updateArray.push(allNodes[nodeId]);
+      }
+    }
+    nodes.update(updateArray);
+  }
+}
+
+function selectNode(nodes) {
+  network.selectNodes(nodes);
+  neighbourhoodHighlight({ nodes: nodes });
+  return nodes;
+}
+
+function selectNodes(nodes) {
+  network.selectNodes(nodes);
+  filterHighlight({nodes: nodes});
+  return nodes;
+}
+
+function highlightFilter(filter) {
+  let selectedNodes = []
+  let selectedProp = filter['property']
+  if (filter['item'] === 'node') {
+    let allNodes = nodes.get({ returnType: "Object" });
+    for (let nodeId in allNodes) {
+      if (allNodes[nodeId][selectedProp] && filter['value'].includes((allNodes[nodeId][selectedProp]).toString())) {
+        selectedNodes.push(nodeId)
+      }
+    }
+  }
+  else if (filter['item'] === 'edge'){
+    let allEdges = edges.get({returnType: 'object'});
+    // check if the selected property exists for selected edge and select the nodes connected to the edge
+    for (let edge in allEdges) {
+      if (allEdges[edge][selectedProp] && filter['value'].includes((allEdges[edge][selectedProp]).toString())) {
+        selectedNodes.push(allEdges[edge]['from'])
+        selectedNodes.push(allEdges[edge]['to'])
+      }
+    }
+  }
+  selectNodes(selectedNodes)
+}</script>
+            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/dist/vis-network.min.css" integrity="sha512-WgxfT5LWjfszlPHXRmBWHkV2eceiWTOBvrKCNbdgDYTHrT2AeLCGbF4sZlZw3UMN3WtL0tGUoIAKsu8mllg/XA==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/vis-network.min.js" integrity="sha512-LnvoEWDFrqGHlHmDD2101OrLcbsfkrzoSpvtSQtxK3RMnRV0eOkhhBN2dXHKRrUU8p2DGRTk35n4O8nWSVe1mQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+            
+            
+            
+            
+            
+            
+
+        
+<center>
+<h1></h1>
+</center>
+
+<!-- <link rel="stylesheet" href="../node_modules/vis/dist/vis.min.css" type="text/css" />
+<script type="text/javascript" src="../node_modules/vis/dist/vis.js"> </script>-->
+        <link
+          href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta3/dist/css/bootstrap.min.css"
+          rel="stylesheet"
+          integrity="sha384-eOJMYsd53ii+scO/bJGFsiCZc+5NDVN2yr8+0RDqr0Ql0h+rP48ckxlpbzKgwra6"
+          crossorigin="anonymous"
+        />
+        <script
+          src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta3/dist/js/bootstrap.bundle.min.js"
+          integrity="sha384-JEW9xMcG8R+pH31jmWH6WWP0WintQrMb4s7ZOdauHnUtxwoG2vI5DkLtS3qm9Ekf"
+          crossorigin="anonymous"
+        ></script>
+
+
+        <center>
+          <h1></h1>
+        </center>
+        <style type="text/css">
+
+             #mynetwork {
+                 width: 100%;
+                 height: 800px;
+                 background-color: #ffffff;
+                 border: 1px solid lightgray;
+                 position: relative;
+                 float: left;
+             }
+
+             
+
+             
+
+             
+        </style>
+    </head>
+
+
+    <body>
+        <div class="card" style="width: 100%">
+            
+            
+            <div id="mynetwork" class="card-body"></div>
+        </div>
+
+        
+        
+
+        <script type="text/javascript">
+
+              // initialize global variables.
+              var edges;
+              var nodes;
+              var allNodes;
+              var allEdges;
+              var nodeColors;
+              var originalNodes;
+              var network;
+              var container;
+              var options, data;
+              var filter = {
+                  item : '',
+                  property : '',
+                  value : []
+              };
+
+              
+
+              
+
+              // This method is responsible for drawing the graph, returns the drawn network
+              function drawGraph() {
+                  var container = document.getElementById('mynetwork');
+
+                  
+
+                  // parsing and collecting nodes and edges from the python
+                  nodes = new vis.DataSet([{"color": "#97c2fc", "entry_type": "gene", "id": "hsa:226", "label": "hsa:226", "shape": "dot", "size": 10, "synonyms": ["hsa:229", "hsa:230"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:5211", "label": "hsa:5211", "shape": "dot", "size": 10, "synonyms": ["hsa:5213", "hsa:5214"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:7167", "label": "hsa:7167", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:2597", "label": "hsa:2597", "shape": "dot", "size": 10, "synonyms": ["hsa:26330"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:2203", "label": "hsa:2203", "shape": "dot", "size": 10, "synonyms": ["hsa:8789"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:217", "label": "hsa:217", "shape": "dot", "size": 10, "synonyms": ["hsa:219", "hsa:223", "hsa:224", "hsa:501"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:10327", "label": "hsa:10327", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:124", "label": "hsa:124", "shape": "dot", "size": 10, "synonyms": ["hsa:125", "hsa:126", "hsa:127", "hsa:128", "hsa:130", "hsa:131"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:218", "label": "hsa:218", "shape": "dot", "size": 10, "synonyms": ["hsa:221", "hsa:222"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:5160", "label": "hsa:5160", "shape": "dot", "size": 10, "synonyms": ["hsa:5161", "hsa:5162"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:1738", "label": "hsa:1738", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:1737", "label": "hsa:1737", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:160287", "label": "hsa:160287", "shape": "dot", "size": 10, "synonyms": ["hsa:3939", "hsa:3945", "hsa:3948", "hsa:92483"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:5313", "label": "hsa:5313", "shape": "dot", "size": 10, "synonyms": ["hsa:5315"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:2023", "label": "hsa:2023", "shape": "dot", "size": 10, "synonyms": ["hsa:2026", "hsa:2027", "hsa:387712"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:441531", "label": "hsa:441531", "shape": "dot", "size": 10, "synonyms": ["hsa:5223", "hsa:5224", "hsa:669"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:5230", "label": "hsa:5230", "shape": "dot", "size": 10, "synonyms": ["hsa:5232"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:9562", "label": "hsa:9562", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:669", "label": "hsa:669", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:2821", "label": "hsa:2821", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:2645", "label": "hsa:2645", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:3098", "label": "hsa:3098", "shape": "dot", "size": 10, "synonyms": ["hsa:3099", "hsa:3101", "hsa:80201"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:5236", "label": "hsa:5236", "shape": "dot", "size": 10, "synonyms": ["hsa:55276"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:2538", "label": "hsa:2538", "shape": "dot", "size": 10, "synonyms": ["hsa:57818", "hsa:92579"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:130589", "label": "hsa:130589", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:83440", "label": "hsa:83440", "shape": "dot", "size": 10, "synonyms": []}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:5105", "label": "hsa:5105", "shape": "dot", "size": 10, "synonyms": ["hsa:5106"]}, {"color": "#97c2fc", "entry_type": "gene", "id": "hsa:55902", "label": "hsa:55902", "shape": "dot", "size": 10, "synonyms": ["hsa:84532"]}]);
+                  edges = new vis.DataSet([{"arrows": "to", "from": "hsa:226", "relationship": "compound", "to": "hsa:5211", "width": 1}, {"arrows": "to", "from": "hsa:226", "relationship": "compound", "to": "hsa:7167", "width": 1}, {"arrows": "to", "from": "hsa:226", "relationship": "compound", "to": "hsa:2597", "width": 1}, {"arrows": "to", "from": "hsa:226", "relationship": "compound", "to": "hsa:2203", "width": 1}, {"arrows": "to", "from": "hsa:217", "relationship": "compound", "to": "hsa:10327", "width": 1}, {"arrows": "to", "from": "hsa:217", "relationship": "compound", "to": "hsa:124", "width": 1}, {"arrows": "to", "from": "hsa:218", "relationship": "compound", "to": "hsa:124", "width": 1}, {"arrows": "to", "from": "hsa:218", "relationship": "compound", "to": "hsa:10327", "width": 1}, {"arrows": "to", "from": "hsa:5160", "relationship": "compound", "to": "hsa:1738", "width": 1}, {"arrows": "to", "from": "hsa:5160", "relationship": "compound", "to": "hsa:1737", "width": 1}, {"arrows": "to", "from": "hsa:5160", "relationship": "compound", "to": "hsa:160287", "width": 1}, {"arrows": "to", "from": "hsa:5160", "relationship": "compound", "to": "hsa:5313", "width": 1}, {"arrows": "to", "from": "hsa:1737", "relationship": "compound", "to": "hsa:1738", "width": 1}, {"arrows": "to", "from": "hsa:160287", "relationship": "compound", "to": "hsa:5313", "width": 1}, {"arrows": "to", "from": "hsa:5313", "relationship": "compound", "to": "hsa:2023", "width": 1}, {"arrows": "to", "from": "hsa:2023", "relationship": "compound", "to": "hsa:441531", "width": 1}, {"arrows": "to", "from": "hsa:441531", "relationship": "compound", "to": "hsa:5230", "width": 1}, {"arrows": "to", "from": "hsa:441531", "relationship": "compound", "to": "hsa:9562", "width": 1}, {"arrows": "to", "from": "hsa:2597", "relationship": "compound", "to": "hsa:669", "width": 1}, {"arrows": "to", "from": "hsa:2597", "relationship": "compound", "to": "hsa:5230", "width": 1}, {"arrows": "to", "from": "hsa:7167", "relationship": "compound", "to": "hsa:226", "width": 1}, {"arrows": "to", "from": "hsa:7167", "relationship": "compound", "to": "hsa:2597", "width": 1}, {"arrows": "to", "from": "hsa:5211", "relationship": "compound", "to": "hsa:2821", "width": 1}, {"arrows": "to", "from": "hsa:2203", "relationship": "compound", "to": "hsa:2821", "width": 1}, {"arrows": "to", "from": "hsa:2821", "relationship": "compound", "to": "hsa:2645", "width": 1}, {"arrows": "to", "from": "hsa:2821", "relationship": "compound", "to": "hsa:3098", "width": 1}, {"arrows": "to", "from": "hsa:2821", "relationship": "compound", "to": "hsa:5236", "width": 1}, {"arrows": "to", "from": "hsa:2821", "relationship": "compound", "to": "hsa:2538", "width": 1}, {"arrows": "to", "from": "hsa:5236", "relationship": "compound", "to": "hsa:2821", "width": 1}, {"arrows": "to", "from": "hsa:5236", "relationship": "compound", "to": "hsa:2645", "width": 1}, {"arrows": "to", "from": "hsa:5236", "relationship": "compound", "to": "hsa:2538", "width": 1}, {"arrows": "to", "from": "hsa:5236", "relationship": "compound", "to": "hsa:3098", "width": 1}, {"arrows": "to", "from": "hsa:3098", "relationship": "compound", "to": "hsa:130589", "width": 1}, {"arrows": "to", "from": "hsa:3098", "relationship": "compound", "to": "hsa:2821", "width": 1}, {"arrows": "to", "from": "hsa:2645", "relationship": "compound", "to": "hsa:130589", "width": 1}, {"arrows": "to", "from": "hsa:2645", "relationship": "compound", "to": "hsa:2821", "width": 1}, {"arrows": "to", "from": "hsa:130589", "relationship": "compound", "to": "hsa:3098", "width": 1}, {"arrows": "to", "from": "hsa:130589", "relationship": "compound", "to": "hsa:2645", "width": 1}, {"arrows": "to", "from": "hsa:130589", "relationship": "compound", "to": "hsa:83440", "width": 1}, {"arrows": "to", "from": "hsa:130589", "relationship": "compound", "to": "hsa:2538", "width": 1}, {"arrows": "to", "from": "hsa:5230", "relationship": "compound", "to": "hsa:669", "width": 1}, {"arrows": "to", "from": "hsa:5105", "relationship": "compound", "to": "hsa:5313", "width": 1}, {"arrows": "to", "from": "hsa:5105", "relationship": "compound", "to": "hsa:2023", "width": 1}, {"arrows": "to", "from": "hsa:669", "relationship": "compound", "to": "hsa:5230", "width": 1}, {"arrows": "to", "from": "hsa:669", "relationship": "compound", "to": "hsa:9562", "width": 1}, {"arrows": "to", "from": "hsa:669", "relationship": "compound", "to": "hsa:441531", "width": 1}, {"arrows": "to", "from": "hsa:669", "relationship": "compound", "to": "hsa:669", "width": 1}, {"arrows": "to", "from": "hsa:55902", "relationship": "compound", "to": "hsa:1737", "width": 1}, {"arrows": "to", "from": "hsa:55902", "relationship": "compound", "to": "hsa:218", "width": 1}, {"arrows": "to", "from": "hsa:55902", "relationship": "compound", "to": "hsa:217", "width": 1}, {"arrows": "to", "from": "hsa:83440", "relationship": "compound", "to": "hsa:2821", "width": 1}, {"arrows": "to", "from": "hsa:83440", "relationship": "compound", "to": "hsa:5236", "width": 1}, {"arrows": "to", "from": "hsa:9562", "relationship": "compound", "to": "hsa:2023", "width": 1}]);
+
+                  nodeColors = {};
+                  allNodes = nodes.get({ returnType: "Object" });
+                  for (nodeId in allNodes) {
+                    nodeColors[nodeId] = allNodes[nodeId].color;
+                  }
+                  allEdges = edges.get({ returnType: "Object" });
+                  // adding nodes and edges to the graph
+                  data = {nodes: nodes, edges: edges};
+
+                  var options = {
+    "configure": {
+        "enabled": false
+    },
+    "edges": {
+        "color": {
+            "inherit": true
+        },
+        "smooth": {
+            "enabled": true,
+            "type": "dynamic"
+        }
+    },
+    "interaction": {
+        "dragNodes": true,
+        "hideEdgesOnDrag": false,
+        "hideNodesOnDrag": false
+    },
+    "physics": {
+        "enabled": false,
+        "stabilization": {
+            "enabled": true,
+            "fit": true,
+            "iterations": 1000,
+            "onlyDynamicEdges": false,
+            "updateInterval": 50
+        }
+    }
+};
+
+                  
+
+
+                  
+
+                  network = new vis.Network(container, data, options);
+
+                  
+
+                  
+
+                  
+
+
+                  
+
+                  return network;
+
+              }
+              drawGraph();
+        </script>
+    </body>
+</html>
