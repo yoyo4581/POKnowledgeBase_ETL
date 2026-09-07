@@ -235,3 +235,4 @@ node_modules/
 
 # added by merge_versions.py
 data/
+password.txt
