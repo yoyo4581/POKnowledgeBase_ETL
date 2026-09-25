@@ -1,3 +1,4 @@
+import re
 import requests
 import shutil
 import tempfile
@@ -10,6 +11,23 @@ UNIPROT_STREAM_URL = "https://rest.uniprot.org/uniprotkb/stream"
 
 LOCAL_PATH = Path("data/idmapping_selected.tab")
 META_PATH = Path("data/idmapping_selected.tab.meta")
+
+_EVIDENCE_TAG_RE = re.compile(r"\{[^}]*\}")
+_FUNCTION_PREFIX_RE = re.compile(r"FUNCTION:\s*")
+
+
+def clean_function_text(raw: str) -> str:
+    """
+    Strips UniProt's cc_function markup down to plain prose: the repeated
+    'FUNCTION:' section prefix (one per isoform-specific note) and the
+    trailing {ECO:...|PubMed:...} evidence tags, then collapses whitespace.
+    Returns '' for entries with no function annotation at all.
+    """
+    if not raw:
+        return ""
+    text = _EVIDENCE_TAG_RE.sub("", raw)
+    text = _FUNCTION_PREFIX_RE.sub("", text)
+    return " ".join(text.split())
 
 
 class UniProt_ETL:

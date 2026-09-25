@@ -1,5 +1,6 @@
 import uuid
 import logging
+from decimal import Decimal
 from typing import Literal, Optional, Iterator
 import pyodbc
 
@@ -7,6 +8,7 @@ from functools import wraps
 from src.builders.SQL.schema import table_schemas, resolve_clear_order, AnnotationTables
 from src.builders.SQL.schema.types import TableSchema, IdentityHashSync, DiffSync, DefaultSync
 from src.builders.SQL.schema import table_managers, TableManager
+from src.models.kegg import EntityType
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +34,17 @@ def sql_safe(label=None):
 
 
 class SQL_State:
-    def __init__(self, conn: pyodbc.Connection, run_id: str):
+    def __init__(self, conn: pyodbc.Connection, run_id: str, read_conn: Optional[pyodbc.Connection] = None):
         self.run_id = run_id
         self.conn = conn
+        # A long-lived streaming SELECT (_batch_receive) holds its cursor's
+        # result set open across many yields. If a write on `conn` (stage_data,
+        # upsert_data, _clear_table_rows, ...) commits while that cursor is
+        # still mid-fetch, the commit ends the connection's shared transaction
+        # and the next fetchmany() on that cursor fails with a driver-level
+        # "Function sequence error". Reads get their own connection so a write
+        # commit elsewhere never invalidates an in-progress streaming fetch.
+        self.read_conn = read_conn if read_conn is not None else conn
         self._staging_ready: set[str] = set()   # per-run cache, avoids re-querying INFORMATION_SCHEMA
         self._production_verified = False
         self.ready = self._check_connection()
@@ -171,18 +181,72 @@ class SQL_State:
         logger.info("Created sql table%s", f" {table_name}" if table_name else "")
         return True
 
+    @staticmethod
+    def _rows_to_dicts(columns: list[str], rows) -> list[dict]:
+        # pyodbc returns NUMERIC/DECIMAL columns (e.g. MOL_WEIGHT, mass) as
+        # decimal.Decimal, which neither the Neo4j driver nor json.dumps
+        # accept -- normalize to float once here so every caller gets a
+        # plain float instead of patching each downstream dataclass/serializer.
+        return [
+            {
+                col: (float(val) if isinstance(val, Decimal) else val)
+                for col, val in zip(columns, row)
+            }
+            for row in rows
+        ]
+
     def _batch_receive(self, fetch_query: str, table_name: str, batch_size: int = 10000)->Iterator[list[dict]]:
-        with self.conn.cursor() as cursor:
+        with self.read_conn.cursor() as cursor:
             cursor.execute(fetch_query)
             columns = [col[0] for col in cursor.description]
 
             row_count = 0
             while rows := cursor.fetchmany(batch_size):
                 row_count += len(rows)
-                yield [dict(zip(columns, row)) for row in rows]
+                yield self._rows_to_dicts(columns, rows)
 
             if row_count == 0:
                 raise ValueError(f"Empty data table {table_name}")
+
+    @sql_safe(label="fetching grouped data from SQL dbo table")
+    def fetch_grouped(self, table_name: str, group_col: str, batch_size: int = 100) -> Iterator[list[dict]]:
+        """
+        Chunks dbo.<table_name> by DISTINCT group_col values, batch_size ids
+        at a time, yielding every row for that batch of ids together in one
+        list. Not row-position pagination -- the chunk boundary is drawn
+        between distinct group_col values, never between rows sharing one,
+        so a caller grouping rows by group_col (e.g. one entrez_id's several
+        uniprot_ids) always sees a complete group in a single yield, without
+        ever materializing the whole table in memory. _batch_receive's plain
+        SELECT * chunks by row count instead, which has no such guarantee.
+        """
+        self._assert_ready()
+        last_id = None
+        with self.read_conn.cursor() as cursor:
+            while True:
+                if last_id is None:
+                    cursor.execute(
+                        f"SELECT DISTINCT TOP {batch_size} {group_col} "
+                        f"FROM dbo.{table_name} ORDER BY {group_col}"
+                    )
+                else:
+                    cursor.execute(
+                        f"SELECT DISTINCT TOP {batch_size} {group_col} "
+                        f"FROM dbo.{table_name} WHERE {group_col} > ? ORDER BY {group_col}",
+                        last_id,
+                    )
+                id_batch = [row[0] for row in cursor.fetchall()]
+                if not id_batch:
+                    return
+                last_id = id_batch[-1]
+
+                placeholders = ", ".join("?" for _ in id_batch)
+                cursor.execute(
+                    f"SELECT * FROM dbo.{table_name} WHERE {group_col} IN ({placeholders})",
+                    id_batch,
+                )
+                columns = [col[0] for col in cursor.description]
+                yield self._rows_to_dicts(columns, cursor.fetchall())
 
     @sql_safe(label="fetching data from SQL dbo or staging table")
     def fetch_data(self, table_name: str, kind: Literal["dbo", "staging", "diff"], batch_size: int = 10000)->Iterator[list[dict]]:
@@ -240,14 +304,38 @@ class SQL_State:
         assert schema.key is not None, ValueError("Table doesn't have a matching key id with entities entity_id")
 
         fetch_query = f"""
-        SELECT *
-        FROM diff.entities as d
-        INNER JOIN dbo.{table_name} as p
-        ON d.entity_id = p.{schema.key}
+        SELECT p.entity_id, p.entity_type, a.*
+        FROM dbo.entities AS p
+        INNER JOIN dbo.{table_name} AS a
+            ON p.entity_id = CAST(a.{schema.key} AS VARCHAR(50))
+        WHERE EXISTS (
+            SELECT 1 FROM diff.entities AS d
+            WHERE d.entity_id = p.entity_id
+        )
         """
         yield from self._batch_receive(fetch_query, table_name)
 
-    def missing_tables_check(self, kind: Literal['dbo', 'staging']) -> list[str]:
+    @sql_safe(label="fetching uniprot ids for diffed gene entities")
+    def fetch_diff_gene_uniprot_ids(self) -> Iterator[list[dict]]:
+        """
+        uniprot_ids for gene entities that changed this run (diff.entities),
+        joined straight through dbo.entities and dbo.EntrezUniprotMap in one
+        query -- same shape as load_from_diff, streamed via _batch_receive's
+        fetchmany instead of collecting a diff batch's entity_ids in Python
+        and re-querying per batch with a parameterized IN-list (which risks
+        exceeding SQL Server's ~2100 parameter limit once a diff batch holds
+        more than a couple thousand genes).
+        """
+        fetch_query = f"""
+        SELECT m.uniprot_id
+        FROM diff.entities AS d
+        INNER JOIN dbo.entities AS e ON d.entity_id = e.entity_id
+        INNER JOIN dbo.EntrezUniprotMap AS m ON e.entity_id = CAST(m.entrez_id AS VARCHAR(50))
+        WHERE e.entity_type = '{EntityType.GENE.value}'
+        """
+        yield from self._batch_receive(fetch_query, "EntrezUniprotMap")
+
+    def missing_tables_check(self, kind: Literal['dbo', 'staging', 'diff']) -> list[str]:
         self._assert_ready()
         with self.conn.cursor() as cursor:
             cursor.execute(
@@ -266,10 +354,25 @@ class SQL_State:
     # ------------------------------------------------------------------ #
 
     def wipe_environment(self, kind: Literal["staging", "dbo"]):
+        """
+        table_schemas is the full code-level schema -- it does not reflect
+        which tables have actually been physically created yet. Staging
+        tables in particular are created lazily (ensure_staging_ready, on
+        that table's first stage_data call), so a table an entity type that
+        hasn't been staged/annotated even once in this environment (e.g. no
+        drug/glycan entities encountered yet) can be entirely absent from
+        `staging`. Skip anything missing rather than assuming parity.
+        """
+        missing = set(self.missing_tables_check(kind))
+        missing_diff = set(self.missing_tables_check("diff"))
+
         table_clear_order = resolve_clear_order(table_schemas)
         for target_table in table_clear_order.order:
+            if target_table in missing:
+                continue
+
             table_schema = table_schemas[target_table]
-            if not isinstance(table_schema.sync, DefaultSync):
+            if not isinstance(table_schema.sync, DefaultSync) and target_table not in missing_diff:
                 self._clear_table_rows(target_table, "diff")
 
             if table_schema.constraints:

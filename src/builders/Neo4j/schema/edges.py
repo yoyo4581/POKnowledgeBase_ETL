@@ -58,6 +58,21 @@ class BaseNeo4jEdge(ABC):
     def _has_pathway_id(cls) -> bool:
         return any(f.name == "pathway_id" for f in fields(cls))
 
+    @staticmethod
+    def _quote(identifier: str) -> str:
+        """
+        Backtick-quote a label/type for splicing into Cypher literal text
+        (relationship types can't be bound as query parameters). Needed
+        because _label_field-derived labels come from external data (e.g.
+        KGML relation_type values like "binding/association" or "indirect
+        effect") and aren't valid unquoted Cypher identifiers. A backtick in
+        the value itself would let it break out of the quoted identifier, so
+        that's rejected outright rather than escaped.
+        """
+        if "`" in identifier:
+            raise ValueError(f"unsafe Cypher identifier: {identifier!r}")
+        return f"`{identifier}`"
+
     def to_row(self) -> dict:
         """Splits the dataclass into the identity key + everything else as props."""
         data = asdict(self)
@@ -78,9 +93,9 @@ class BaseNeo4jEdge(ABC):
     def _match_clause(cls, verb: str, *, label: str, source_type: str, target_type: str,
                        source_key: str, target_key: str) -> str:
         return (
-            f"{verb} (a:{source_type} {{{source_key}: row.source_id}})"
-            f"-[r:{label}]->"
-            f"(b:{target_type} {{{target_key}: row.target_id}})"
+            f"{verb} (a:{cls._quote(source_type)} {{{source_key}: row.source_id}})"
+            f"-[r:{cls._quote(label)}]->"
+            f"(b:{cls._quote(target_type)} {{{target_key}: row.target_id}})"
         )
 
     @classmethod
@@ -93,8 +108,8 @@ class BaseNeo4jEdge(ABC):
         # this relationship doesn't yet, Neo4j creates duplicate nodes
         # instead of reusing the ones already in the graph.
         return (
-            f"MATCH (a:{source_type} {{{source_key}: row.source_id}})\n"
-            f"        MATCH (b:{target_type} {{{target_key}: row.target_id}})"
+            f"MATCH (a:{cls._quote(source_type)} {{{source_key}: row.source_id}})\n"
+            f"        MATCH (b:{cls._quote(target_type)} {{{target_key}: row.target_id}})"
         )
 
     @classmethod
@@ -104,11 +119,12 @@ class BaseNeo4jEdge(ABC):
             source_type=source_type, target_type=target_type,
             source_key=source_key, target_key=target_key,
         )
+        quoted_label = cls._quote(label)
         if cls._has_pathway_id():
             return f"""
             UNWIND $rows AS row
             {node_match}
-            MERGE (a)-[r:{label}]->(b)
+            MERGE (a)-[r:{quoted_label}]->(b)
             SET r += row.props
             SET r.pathway_ids = CASE
                 WHEN row.pathway_id IN coalesce(r.pathway_ids, [])
@@ -119,7 +135,7 @@ class BaseNeo4jEdge(ABC):
         return f"""
         UNWIND $rows AS row
         {node_match}
-        MERGE (a)-[r:{label}]->(b)
+        MERGE (a)-[r:{quoted_label}]->(b)
         SET r += row.props
         """
 
@@ -177,6 +193,8 @@ ENTITY_TYPE_LABELS = {
     "compound": "Compound",
     "ortholog": "Ortholog",
     "reaction": "Reaction",
+    "drug": "Drug",
+    "glycan": "Glycan",
 }
 
 @dataclass()
@@ -233,27 +251,31 @@ class Interactions(BaseNeo4jEdge):
         return cls(**filtered)
 
 REACTION_ROLE_CONFIG = {
-    "substrate": {"source_type": "Compound", "target_type": "Reaction", "label": "SUBSTRATE_OF"},
-    "product":   {"source_type": "Reaction", "target_type": "Compound", "label": "PRODUCES"},
-    "catalyst":    {"source_type": "Gene",     "target_type": "Reaction", "label": "CATALYZES"},
+    "substrate": {"label": "SUBSTRATE_OF"},
+    "product":   {"label": "PRODUCES"},
+    "catalyst":  {"label": "CATALYZES"},
 }
 
 @dataclass()
 class ReactionRelation(BaseNeo4jEdge):
     role: Literal["substrate", "product", "catalyst"] = "substrate"
-    _structural_fields: ClassVar[tuple] = ("role",)
+    entity_type: str = ""
+    _structural_fields: ClassVar[tuple] = ("role", "entity_type")
 
     def __post_init__(self):
         if self.role not in REACTION_ROLE_CONFIG:
             raise ValueError(f"ReactionRelation got unknown role={self.role!r}")
+        if self.entity_type not in ENTITY_TYPE_LABELS:
+            raise ValueError(f"ReactionRelation got unknown entity_type={self.entity_type!r}")
 
     @property
     def source_type(self) -> str:
-        return REACTION_ROLE_CONFIG[self.role]["source_type"]
+        # product: reaction -> entity. substrate/catalyst: entity -> reaction.
+        return "Reaction" if self.role == "product" else ENTITY_TYPE_LABELS[self.entity_type]
 
     @property
     def target_type(self) -> str:
-        return REACTION_ROLE_CONFIG[self.role]["target_type"]
+        return "Reaction" if self.role in ("substrate", "catalyst") else ENTITY_TYPE_LABELS[self.entity_type]
 
     @property
     def __label__(self) -> str:
@@ -262,14 +284,17 @@ class ReactionRelation(BaseNeo4jEdge):
     @classmethod
     def from_sql(cls, data) -> "ReactionRelation":
         role = data["role"]
+        entity_type = data["entity_type"]
         return cls(
             source_id=data["entity_id"],
             target_id=data["reaction_id"],
             role=role,
+            entity_type=entity_type,
         ) if role != "product" else cls(
             source_id = data["reaction_id"],
             target_id = data["entity_id"],
-            role = role
+            role = role,
+            entity_type = entity_type,
         )
 
 

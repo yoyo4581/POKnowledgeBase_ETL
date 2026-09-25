@@ -84,11 +84,13 @@ sample_edges = [
     edges.Interactions(source_id="hsa:673", target_id="hsa:999", pathway_id="path:hsa04012", relation_type="INHIBITION", source_entity_type="gene", target_entity_type="gene"),
     edges.Interactions(source_id="hsa:673", target_id="cpd:C00002", pathway_id="path:hsa04010", relation_type="ACTIVATION", source_entity_type="gene", target_entity_type="compound"),
 
-    # fully dynamic source_type/target_type/__label__ via role -- three
-    # distinct batches, one per role
-    edges.ReactionRelation(source_id="cpd:C00002", target_id="rn:R00200", role="substrate"),
-    edges.ReactionRelation(source_id="rn:R00200", target_id="cpd:C00008", role="product"),
-    edges.ReactionRelation(source_id="hsa:673", target_id="rn:R00200", role="catalyst"),
+    # fully dynamic source_type/target_type/__label__ via role + entity_type --
+    # distinct batches per (role, entity_type) pair; includes a drug substrate
+    # to cover a non-Compound reaction participant.
+    edges.ReactionRelation(source_id="cpd:C00002", target_id="rn:R00200", role="substrate", entity_type="compound"),
+    edges.ReactionRelation(source_id="dr:D00195", target_id="rn:R00200", role="substrate", entity_type="drug"),
+    edges.ReactionRelation(source_id="rn:R00200", target_id="cpd:C00008", role="product", entity_type="compound"),
+    edges.ReactionRelation(source_id="hsa:673", target_id="rn:R00200", role="catalyst", entity_type="gene"),
 ]
 
 

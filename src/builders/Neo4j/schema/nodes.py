@@ -39,7 +39,15 @@ class BaseNeo4jNode:
             for k, v in data.items()
             if v is not None
         }
-        return {"id": key_val, "props": props}
+        # MERGE identity must be type-stable across every path that can
+        # create/match a given node. Gene's id comes from entities.entity_id
+        # (SQL VARCHAR -> str) when structure creates the node first, but
+        # from GeneData.uid (SQL INT -> int) when annotation later upserts
+        # it -- MERGE {id: 673} and MERGE {id: "673"} are different node
+        # identities to Neo4j, so leaving key_val's native type here
+        # silently creates a second, edge-less node instead of matching the
+        # one structure already created.
+        return {"id": str(key_val), "props": props}
 
     @classmethod
     def upsert_cypher(cls, label: str) -> str:
@@ -98,6 +106,10 @@ class Pathway(BaseNeo4jNode):
     name: str
     class_id: str
     __label__: ClassVar[str] = "Pathway"
+    __column_map__: ClassVar[dict[str, str]] = {
+        "pathway_id": "id",
+        "description": "name",
+    }
 
 @dataclass
 class Gene(BaseNeo4jNode):
@@ -125,6 +137,31 @@ class Compound(BaseNeo4jNode):
     }
 
 @dataclass
+class Drug(BaseNeo4jNode):
+    id: str
+    name: str
+    formula: str
+    drug_synonyms: str
+    MOL_WEIGHT: float
+    __label__: ClassVar[str] = "Drug"
+    __column_map__: ClassVar[dict[str, str]] = {
+        "drug_id": "id",
+        "drug_name": "name"
+    }
+
+@dataclass
+class Glycan(BaseNeo4jNode):
+    id: str
+    name: str
+    composition: str
+    mass: float
+    __label__: ClassVar[str] = "Glycan"
+    __column_map__: ClassVar[dict[str, str]] = {
+        "glycan_id": "id",
+        "glycan_name": "name"
+    }
+
+@dataclass
 class Ortholog(BaseNeo4jNode):
     id: str
     name: str
@@ -142,8 +179,6 @@ class Reaction(BaseNeo4jNode):
     definition: str
     equation: str
     comment: str | None
-    reaction_type: str | None
-    pathway_id: str | None
     __label__: ClassVar[str] = "Reaction"
     __column_map__: ClassVar[dict[str, str]] = {
         "reaction_id": "id"
@@ -160,7 +195,9 @@ Entity_REGISTRY: dict[EntityType, type[BaseNeo4jNode]] = {
     EntityType.COMPOUND: Compound,
     EntityType.ORTHOLOG: Ortholog,
     EntityType.REACTION: Reaction,
-    EntityType.PATHWAY: Pathway
+    EntityType.PATHWAY: Pathway,
+    EntityType.DRUG: Drug,
+    EntityType.GLYCAN: Glycan
 }
 
 
@@ -173,6 +210,11 @@ def build_neo4j_entity(entity_type: EntityType, data: dict) -> BaseNeo4jNode:
 
 def build_neo4j_annotation(entity_type: EntityType, data: dict) -> BaseNeo4jNode:
     cls = Entity_REGISTRY[entity_type]
+    # SQL columns (pathway_id, gene_name, uid, ...) don't share names with
+    # their node fields (id, name, ...) -- __column_map__ has to translate
+    # them before filtering, or the unmapped raw names just get dropped and
+    # construction fails on the now-missing required fields.
+    mapped = {cls.__column_map__.get(k, k): v for k, v in data.items()}
     valid_keys = {f.name for f in fields(cls)}
-    filtered = {k: v for k, v in data.items() if k in valid_keys}
+    filtered = {k: v for k, v in mapped.items() if k in valid_keys}
     return cls(**filtered)

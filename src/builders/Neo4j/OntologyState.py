@@ -23,7 +23,8 @@ class OntoStateManager:
         for pred, group in groupby(rows_sorted, key=lambda r: r["pred"]):
             tx.run(f"""
                 UNWIND $rows as row
-                MATCH (a:Ontology {{id: row.src}}), (b:Ontology {{id: row.obj}})
+                MATCH (a:Ontology {{id: row.src}})
+                MATCH (b:Ontology {{id: row.obj}})
                 MERGE (a)-[:`{pred}`]->(b)
             """, rows=list(group))
 
@@ -39,7 +40,7 @@ class OntoStateManager:
                 MATCH (o:Ontology {{id: row.go_id}})
                 CALL {{
                     WITH row
-                    MATCH (g:Gene {{gene_name: row.symbol}})
+                    MATCH (g:Gene {{name: row.symbol}})
                     RETURN g
                     UNION
                     WITH row
@@ -145,12 +146,23 @@ class OntoStateManager:
                     "RO_0002211": 'regulates', "RO_0002212": 'negatively_regulates'}
 
         print("[sync_ontology_structure] Building node payload...")
+        deprecated_ids = set()
         node_payload = []
         for node in nodes:
             if node['type'] == 'CLASS' and node.get("lbl") is not None:
                 id = clean(node['id'])
-                node_payload.append({"id": id, "props": self.flatten_go_props(node)})
-        print(f"[sync_ontology_structure] {len(node_payload)} nodes to upsert.")
+                props = self.flatten_go_props(node)
+                if props["deprecated"]:
+                    # Skip at build time rather than upserting a full node
+                    # (with all its properties) only to detach-delete it a
+                    # few lines later -- deprecated_ids also lets the edge
+                    # pass below drop any edge that would otherwise try to
+                    # MATCH a node we deliberately never created.
+                    deprecated_ids.add(id)
+                    continue
+                node_payload.append({"id": id, "props": props})
+        print(f"[sync_ontology_structure] {len(node_payload)} nodes to upsert "
+              f"({len(deprecated_ids)} deprecated excluded).")
 
         print("[sync_ontology_structure] Building edge payload...")
         edge_payload = [{
@@ -158,7 +170,8 @@ class OntoStateManager:
                 'pred': rare_annot.get(clean(e["pred"]), clean(e["pred"])),
                 'obj': clean(e["obj"])
             }
-            for e in edges]
+            for e in edges
+            if clean(e["sub"]) not in deprecated_ids and clean(e["obj"]) not in deprecated_ids]
         print(f"[sync_ontology_structure] {len(edge_payload)} edges to upsert.")
 
         with self.graph_driver.session() as session:

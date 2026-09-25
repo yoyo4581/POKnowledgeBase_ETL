@@ -190,7 +190,16 @@ class DbOpsStrategy(ABC):
 
             case IdentityHashSync():
                 assert schema.sync.identity_hash, "IdentityHashSync requires identity_hash (enforced in __post_init__)"
-                key_columns = {col: schema.columns[col] for col in schema.sync.identity_hash}
+                # identity_hash picks which columns feed the change-detection
+                # hash -- it is not the full set of columns a row has.
+                # IdentityHashSync.diff_output_clause always writes every
+                # column in schema.columns (untracked ones included, e.g. a
+                # timestamp like GOOntologyMeta.last_checked that must stay
+                # out of the hash itself or every run would look "changed"),
+                # so the diff table needs a column for all of them, not just
+                # the identity_hash subset -- otherwise OUTPUT INTO fails on
+                # the first untracked column with "Invalid column name".
+                key_columns = dict(schema.columns)
 
             case CompositeKeySync():
                 assert isinstance(schema.key, PrimaryCompositeKey), "CompositeKeySync requires a PrimaryCompositeKey (enforced in __post_init__)"

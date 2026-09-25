@@ -23,9 +23,6 @@ class KEGGEntityFactory:
     def build_reaction(data)->list[Reaction]:
         reactions = []
         for datum in data:
-            if 'NAME' not in datum:
-                print(datum)
-                continue
             reactions.append(Reaction.from_kegg(datum))
         return reactions
     
@@ -36,7 +33,15 @@ class KEGGEntityFactory:
     @staticmethod
     def build_pathway(data)->list[Pathway]:
         return [Pathway.from_kegg(datum) for datum in data]
-    
+
+    @staticmethod
+    def build_drug(data)->list[Drug]:
+        return [Drug.from_kegg(datum) for datum in data]
+
+    @staticmethod
+    def build_glycan(data)->list[Glycan]:
+        return [Glycan.from_kegg(datum) for datum in data]
+
 
 KEGGEntityFactory.REGISTRY = {
     EntityType.GENE: {
@@ -58,6 +63,14 @@ KEGGEntityFactory.REGISTRY = {
     EntityType.PATHWAY: {
         "table": "PathwayData",
         "builder": KEGGEntityFactory.build_pathway
+    },
+    EntityType.DRUG: {
+        "table": "DrugData",
+        "builder": KEGGEntityFactory.build_drug
+    },
+    EntityType.GLYCAN: {
+        "table": "GlycanData",
+        "builder": KEGGEntityFactory.build_glycan
     }
 }
 

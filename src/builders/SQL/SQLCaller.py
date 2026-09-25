@@ -23,6 +23,7 @@ TrustServerCertificate=yes;
 UID={os.getenv('sql_uid')};
 PWD={os.getenv('sql_pwd')};
 Encrypt=no;
+MARS_Connection=yes;
 """
 
 
@@ -50,6 +51,7 @@ class SQL_ETL:
     def __init__(self, run_id: str | None = None):
         self.run_id = run_id if run_id else str(uuid.uuid4())
         self._conn = None
+        self._read_conn = None
         self._state = None
 
     @property
@@ -59,10 +61,22 @@ class SQL_ETL:
         return self._conn
 
     @property
+    def read_conn(self):
+        """
+        Dedicated connection for long-lived streaming reads (fetch_data,
+        fetch_diff_entities, ...), kept separate from `conn` so a write's
+        commit on `conn` never invalidates an in-progress streaming fetch's
+        open result set -- see SQL_State.__init__ for the failure mode.
+        """
+        if self._read_conn is None:
+            self._read_conn = pyodbc.connect(sql_conn_string)
+        return self._read_conn
+
+    @property
     def sql_state(self):
         """Still used for reads (e.g. fetch_data on diff tables) -- writes now go through TableManager."""
         if self._state is None:
-            self._state = SQL_State(self.conn, run_id=self.run_id)
+            self._state = SQL_State(self.conn, run_id=self.run_id, read_conn=self.read_conn)
         return self._state
 
     

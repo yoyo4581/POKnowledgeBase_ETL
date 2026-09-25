@@ -7,7 +7,6 @@ from src.workflow.producers import *
 
 from src.builders.SQL.SQLCaller import SQL_ETL
 from src.parsers.KEGGCaller import KEGG_ETL
-from src.parsers.UniProt.UniProtCaller import UniProt_ETL
 import logging
 from itertools import chain
 from dotenv import load_dotenv
@@ -191,7 +190,7 @@ def kgml_structure_annotation():
         sql_caller = SQL_ETL(run_id=UUID)
         neo4j_caller = Neo4j_ETL()
 
-        structure_tables = ["EntityPathMem", "reaction_participants", "interactions"]
+        structure_tables = ["reaction_participants"]
         for table in structure_tables:
             if table == "interactions":
                 diffed_edges = sql_caller.sql_state.fetch_diff_interactions()
@@ -284,35 +283,34 @@ def go_ontology_annotation():
         reset_dag_run=True,
     )
 
-    @task()
-    def map_uniprot_entrez_ids():
-        """
-        Responsible for triggering download of entrez_id -> uniprot_id .tab file from uniprot, and updating the current dbo.EntrezUniProtMap table.
-        """
-        uniprot_caller = UniProt_ETL()
-
-        if not uniprot_caller.has_idmapping_changed():
-            raise AirflowSkipException("idmapping file unchanged, skipping EntrezUniprotMap update.")
-
-        sql_caller = SQL_ETL(run_id=UUID)
-        records = produce_entrez_uniprot_map(uniprot_caller)
-        if records:
-            result = consume_entrez_uniprot_map(records, sql_caller)
-            logger.info(result)
+    # entrez_id -> uniprot_id is its own DAG (dags/ontology_build.py) since
+    # it isn't a GO concept -- it's a general Gene<->UniProt crosswalk that
+    # annotate_ontologies below happens to depend on (GO annotation edges
+    # match genes by uniprot_id, so a Gene node with no uniprot_ids property
+    # can never receive one). Same wait_for_completion/reset_dag_run pattern
+    # as refresh_ontology above, for the same reason.
+    refresh_gene_uniprot_map = TriggerDagRunOperator(
+        task_id="refresh_gene_uniprot_map",
+        trigger_dag_id="entrez_uniprot_annotation",
+        wait_for_completion=True,
+        reset_dag_run=True,
+    )
 
     @task(outlets=[NEO4J_KG_COMPLETE])
     def annotate_ontologies():
         go_caller = GO_ETL()
         neo4j_caller = Neo4j_ETL()
 
-        annotation_df = go_caller.read_annotation()
-        neo4j_caller.ontology_manager.sync_ontology_annotations(annotation_df, batch_size=10000)
-        
+        downloaded = go_caller.fetch_latest_go_file(file_type='goa')
+        if downloaded:
+            logger.info("GOA annotation file updated, re-annotating ontology edges.")
+            annotation_df = go_caller.read_annotation()
+            neo4j_caller.ontology_manager.sync_ontology_annotations(annotation_df, batch_size=10000)
 
-    map_ids = map_uniprot_entrez_ids()
+
     annotate = annotate_ontologies()
 
-    refresh_ontology >> map_ids >> annotate
+    refresh_ontology >> refresh_gene_uniprot_map >> annotate
 
 kegg_meta_build()
 kgml_structure_annotation()

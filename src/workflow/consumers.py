@@ -4,6 +4,7 @@ from typing import Iterable, Iterator, TypeVar, Sequence
 from itertools import islice
 from src.models.kegg import *
 from src.models.go import GOOntologyMeta, GOOntologyRecord, EntrezUniprotMap
+from src.models.uniprot import FunctionData
 from src.models.base import BaseSQLObject
 from src.builders.Neo4j.Neo4jCaller import Neo4j_ETL
 from operator import attrgetter
@@ -61,6 +62,18 @@ def consume_pathway_ids(data: Iterator[PathwayIds], sql_caller: SQL_ETL) -> dict
 
 def consume_entrez_uniprot_map(data: Iterator[EntrezUniprotMap], sql_caller: SQL_ETL, batch_size: int = 5000) -> dict:
     return _stage_and_upsert(data, sql_caller, {EntrezUniprotMap.__table_name__: lambda r: [r]}, batch_size)
+
+
+def consume_function_data(data: Iterator[FunctionData], sql_caller: SQL_ETL, batch_size: int = 500) -> dict:
+    return _stage_and_upsert(data, sql_caller, {FunctionData.__table_name__: lambda r: [r]}, batch_size)
+
+
+def consume_gene_uniprot_annotations(batches: Iterator[list[dict]], neo4j_caller: Neo4j_ETL) -> dict:
+    total = 0
+    for batch in batches:
+        result = neo4j_caller.annotate_gene_uniprot_ids(batch)
+        total += result.get("gene_uniprot_ids_annotated", 0)
+    return {"gene_uniprot_ids_annotated": total}
 
 
 def consume_kgml_meta_data(
@@ -193,12 +206,18 @@ def consume_entity_annotations(records: Iterator[dict], sql_caller: SQL_ETL):
     It [{"table_name": }]
     It [KGMLRecord.pathway]
     """
+    # A given diff batch won't necessarily contain every entity type (e.g.
+    # pathways are deliberately never produced here -- see
+    # produce_entity_annotations), so a table missing from a batch is the
+    # normal case, not an error.
     extractors = {
-        Pathway.__table_name__:       lambda r: r[Pathway.__table_name__],
-        Gene.__table_name__:        lambda r: r[Gene.__table_name__],
-        Compound.__table_name__: lambda r: r[Compound.__table_name__],
-        Ortholog.__table_name__:   lambda r: r[Ortholog.__table_name__],
-        Reaction.__table_name__:     lambda r: r[Reaction.__table_name__],
+        Pathway.__table_name__:       lambda r: r.get(Pathway.__table_name__, []),
+        Gene.__table_name__:        lambda r: r.get(Gene.__table_name__, []),
+        Compound.__table_name__: lambda r: r.get(Compound.__table_name__, []),
+        Ortholog.__table_name__:   lambda r: r.get(Ortholog.__table_name__, []),
+        Reaction.__table_name__:     lambda r: r.get(Reaction.__table_name__, []),
+        Drug.__table_name__:     lambda r: r.get(Drug.__table_name__, []),
+        Glycan.__table_name__:     lambda r: r.get(Glycan.__table_name__, []),
     }
 
     return _stage_and_upsert(records, sql_caller, extractors, batch_size=1)

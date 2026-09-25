@@ -1,0 +1,13 @@
+# Retrieval stack for the hybrid + chunk-rerank experiment.
+# Training deps (torch, transformers, datasets) are GO_Contrastive.py's, not these.
+
+qdrant-client>=1.12       # Query API: prefetch, FusionQuery(RRF), query_points_groups
+fastembed>=0.4            # BM25 sparse vectors (Qdrant/bm25) -- needed to BUILD and to QUERY
+sentence-transformers>=3  # loads the fine-tuned BioBERT
+numpy>=1.24
+mcp>=1.2                  # 1.x (FastMCP) and 2.x (MCPServer) are both supported
+
+# Verified against: qdrant-client 1.19.0, fastembed 0.8.0, mcp 2.2.0,
+# sentence-transformers 6.0.1, numpy 2.5.3 (Python 3.13).
+# Pin fastembed to whatever the build machine used: restore re-derives sparse
+# vectors and refuses to run if the BM25 hyperparameters have drifted.

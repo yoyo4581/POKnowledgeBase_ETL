@@ -1,5 +1,10 @@
 from bs4 import BeautifulSoup, Tag
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
 from typing import Literal, Iterator
 from pathlib import Path
@@ -12,6 +17,55 @@ from src.parsers.KEGGEntityFactory import KEGGEntityFactory
 logger = logging.getLogger(__name__)
 
 KEGG_PATH = Path("data/KGML/") # last modified tag
+
+
+class _RateLimiter:
+    """
+    Caps the combined request rate across every thread sharing one instance.
+    A ThreadPoolExecutor's worker count only bounds concurrency (how many
+    requests are in flight at once) -- it doesn't stop those workers from
+    firing in a burst. KEGG is a shared public API with no documented rate
+    limit, so this is what actually keeps us from looking like abuse and
+    getting soft-throttled, independent of pool size.
+    """
+    def __init__(self, max_per_second: float):
+        self._min_interval = 1.0 / max_per_second
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            sleep_for = self._min_interval - (now - self._last_call)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            self._last_call = time.monotonic()
+
+
+def _build_kegg_session() -> requests.Session:
+    """
+    A session shared across requests so the retry-configured adapter (and
+    its underlying connection pool) is reused rather than rebuilt per call.
+    Retries cover exactly the failure modes KEGG has actually produced in
+    this pipeline: connection-level errors (DNS blips, refused connections
+    -- e.g. the NameResolutionError that killed a task outright with no
+    retry at all) via `connect`, plus 429/5xx via `status_forcelist`.
+    `respect_retry_after_header` honors a Retry-After KEGG sends on a 429
+    instead of guessing a backoff.
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        connect=5,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def _find_tag(parent: Tag | BeautifulSoup, name: str) -> Tag:
@@ -36,29 +90,126 @@ def _require_attr(tag: Tag, attr: str) -> str:
         raise ValueError(f"<{tag.name}> missing required string attribute '{attr}'")
     return value
 
+
+KEGG_PREFIX_TO_ENTITY_TYPE: dict[str, EntityType] = {
+    "cpd": EntityType.COMPOUND,
+    "gl": EntityType.GLYCAN,
+    "dr": EntityType.DRUG,
+    "rn": EntityType.REACTION,
+    "hsa": EntityType.GENE,
+    "ko": EntityType.ORTHOLOG,
+    "path": EntityType.PATHWAY,
+}
+
+
+def _parse_kegg_ref(token: str) -> tuple[str, EntityType]:
+    """
+    Splits one 'prefix:code' KEGG reference (e.g. 'gl:G00115') into its bare
+    code and the EntityType its prefix denotes. KGML groups compounds,
+    glycans, and drugs under the same <entry type="compound">/<substrate>/
+    <product> tags, so the tag's own type isn't reliable for entity typing --
+    the prefix on each individual name token is what actually distinguishes
+    them. Uses partition (not split(":")[1]) so a value can't silently split
+    wrong if it ever contains more than one colon.
+    """
+    prefix, sep, code = token.partition(":")
+    if not sep:
+        raise ValueError(f"KEGG reference {token!r} has no ':' prefix")
+    entity_type = KEGG_PREFIX_TO_ENTITY_TYPE.get(prefix)
+    if entity_type is None:
+        raise ValueError(f"Unknown KEGG prefix {prefix!r} in reference {token!r}")
+    return code, entity_type
+
+
+def _parse_kegg_refs(raw: str) -> list[tuple[str, EntityType]]:
+    """
+    Splits a whitespace-separated list of KEGG references -- e.g. a KGML
+    entry's `name` attribute can hold several cross-referenced ids for one
+    node ('cpd:C00022 gl:G00115') -- into (code, EntityType) pairs. Always
+    split on whitespace before touching any individual token; taking the raw
+    attribute value whole (or blindly stripping one hardcoded prefix from it)
+    silently produces a mangled multi-token string like 'dr:D00195 cpd:C06174'
+    instead of two separate references.
+    """
+    return [_parse_kegg_ref(tok) for tok in raw.split()]
+
+
+class KEGGBlockedError(Exception):
+    """
+    Raised when KEGG returns 403 -- observed in practice to be an IP-level
+    block, not a per-request rejection: a real run got 403 on a batch of
+    valid gene ids, then kept getting 403 on completely unrelated glycan
+    batches immediately after, with nothing wrong with any of the requests
+    themselves. Deliberately NOT a subclass of requests.RequestException --
+    callers that catch-and-continue on ordinary request failures (a bad id,
+    a transient timeout) must not catch this one the same way. Continuing
+    to send requests during an active block window is what turns a short
+    block into a long one, so every caller of _get must let this propagate
+    and stop, not log it and move on to the next batch/table/pathway.
+    """
+    pass
+
+
 class KEGG_State:
+    # Shared by every KEGG_State instance -- the connection pool inside the
+    # session and the rate limiter's "last call" clock only mean something
+    # if every caller (including concurrent ThreadPoolExecutor workers, each
+    # of which may construct its own KEGG_ETL()/KEGG_State()) goes through
+    # the same session and the same clock.
+    #
+    # KEGG's documented ceiling (https://www.kegg.jp/kegg/rest/) is "up to
+    # 3 times per second, otherwise your access will be blocked". A real run
+    # got blocked while nominally sitting at exactly 3/sec -- but that was
+    # while base_url was still http://, which KEGG's BigIP 301s to https://;
+    # requests followed that redirect as a second real request per call,
+    # invisible to this limiter, so actual traffic was ~6/sec: double their
+    # stated limit despite the code believing it was compliant. Now that
+    # base_url goes straight to https:// (no redirect, one real request per
+    # call), 2/sec keeps a margin under the documented 3/sec ceiling instead
+    # of sitting right on it.
+    _session = _build_kegg_session()
+    _rate_limiter = _RateLimiter(max_per_second=2)
+
     def __init__(self):
-        self.base_url = "http://rest.kegg.jp"
+        # KEGG's BigIP now 301s every http:// request to https:// -- requests
+        # follows that redirect as a second real HTTP call made internally
+        # by urllib3, which never passes back through _rate_limiter.wait().
+        # That silently doubled real request volume against KEGG's
+        # infrastructure and sent it as an unthrottled back-to-back pair
+        # (rate-limited request, then an instant unthrottled follow-up) --
+        # exactly the kind of burst pattern WAF abuse detection looks for.
+        # Going straight to https:// removes the redirect hop entirely.
+        self.base_url = "https://rest.kegg.jp"
+
+    def _get(self, url: str, timeout: float = 30.0) -> requests.Response:
+        self._rate_limiter.wait()
+        response = self._session.get(url, timeout=timeout)
+        if response.status_code == 403:
+            raise KEGGBlockedError(
+                f"KEGG returned 403 for {url} -- treat as an IP-level block, not a "
+                "retryable/skippable failure. Stop issuing further requests."
+            )
+        return response
 
     def fetch_brite_hierarchy(self, brite_id: str = "br08901")->dict:
         url = f"{self.base_url}/get/br:{brite_id}/json"
-        response = requests.get(url)
+        response = self._get(url)
         if not response.ok:
             logger.error("Failed to fetch BRITE hierarchy %s - status %d", brite_id, response.status_code)
             return {}
         return response.json()
-    
-    
+
+
     def fetch_pathway_kgml(self, pathway_code: str):
-        url = f"http://rest.kegg.jp/get/{pathway_code}/kgml"
-        response = requests.get(url)
+        url = f"{self.base_url}/get/{pathway_code}/kgml"
+        response = self._get(url)
         if not response.ok:
             raise Exception(f"Failed to fetch data for {pathway_code}")
         return response.content
-    
+
     def fetch_pathway_ids(self):
         url = f"{self.base_url}/list/pathway/hsa"
-        response = requests.get(url)
+        response = self._get(url)
         pathway_data = []
         if response.ok:
             logger.info("Successfilly fetched KEGG pathway IDs.")
@@ -112,28 +263,44 @@ class KEGG_ETL:
             pathway_id, description = line.split("\t", 1)
             yield PathwayIds(pathway_id, description)
 
-    KGML_ENTRY_TYPES = {"gene", "ortholog", "compound"}
+    # Gates which KGML <entry> tags get processed at all. Not used to derive
+    # entity type any more -- KEGG lumps compounds/glycans/drugs under
+    # type="compound" (and possibly type="drug"/"glycan" on some diagrams),
+    # so the real type comes from each name token's own prefix instead; see
+    # _parse_kegg_ref.
+    KGML_ENTRY_TYPES = {"gene", "ortholog", "compound", "drug", "glycan"}
 
-    def _parse_kgml_entries(self, soup: BeautifulSoup, pathway_id: str) -> dict[str, KGMLEntry]:
+    def _parse_kgml_entries(self, soup: BeautifulSoup, pathway_id: str) -> tuple[dict[str, KGMLEntry], list[Entity]]:
         entry_map: dict[str, KGMLEntry] = {}
+        reaction_entities: list[Entity] = []
         for entry in soup.find_all("entry"):
             entity_type = entry.get("type")
             if entity_type not in self.KGML_ENTRY_TYPES:
                 continue
 
             entry_id = _require_attr(entry, "id")
-            entity_ids = [name.split(":")[1] for name in _require_attr(entry, "name").split()]
+            refs = _parse_kegg_refs(_require_attr(entry, "name"))
             kgml_entry = KGMLEntry(
-                entities=[Entity(entity_id, EntityType(entity_type)) for entity_id in entity_ids],
-                entity_path_mem=[EntityPathMem(entity_id, pathway_id) for entity_id in entity_ids],
+                entities=[Entity(code, etype) for code, etype in refs],
+                entity_path_mem=[EntityPathMem(code, pathway_id) for code, etype in refs],
             )
 
             if entry.has_attr("reaction"):
-                reaction_id = _require_attr(entry, "reaction").split(":")[1]
-                kgml_entry.entities.append(Entity(reaction_id, EntityType.REACTION))
+                # This entry's own identity is whatever `name` says (a gene,
+                # ortholog, ...); `reaction` just cross-references which
+                # reaction(s) it's involved in for the diagram. Keep those out
+                # of kgml_entry.entities -- both _parse_kgml_reaction_participants
+                # (catalyst derivation) and _parse_kgml_relations (interaction
+                # endpoints) read that list, and a reaction id showing up there
+                # gets treated as if it were the entry's own identity, producing
+                # e.g. a reaction "catalyzing" itself or another reaction.
+                # Tracked separately purely so it still lands in `entities`.
+                reaction_entities.extend(
+                    Entity(code, etype) for code, etype in _parse_kegg_refs(_require_attr(entry, "reaction"))
+                )
 
             entry_map[entry_id] = kgml_entry
-        return entry_map
+        return entry_map, reaction_entities
 
     def _parse_kgml_relations(self, soup: BeautifulSoup, entry_map: dict[str, KGMLEntry], pathway_id: str) -> list[Interaction]:
         interactions = []
@@ -171,16 +338,16 @@ class KEGG_ETL:
         reaction_participants = []
         synthesized_entities: dict[str, Entity] = {}
 
-        def _track_compound(compound_id: str) -> None:
+        def _track_compound(compound_id: str, entity_type: EntityType) -> None:
             if compound_id not in known_entity_ids and compound_id not in synthesized_entities:
-                synthesized_entities[compound_id] = Entity(compound_id, EntityType.COMPOUND)
+                synthesized_entities[compound_id] = Entity(compound_id, entity_type)
 
         for rx in soup.find_all("reaction"):
             rx_entry_id = _require_attr(rx, "id")
             if rx_entry_id not in entry_map:
                 continue
 
-            reaction_ids = [name.removeprefix("rn:") for name in _require_attr(rx, "name").split()]
+            reaction_ids = [code for code, _ in _parse_kegg_refs(_require_attr(rx, "name"))]
             substrates = rx.find_all("substrate")
             products = rx.find_all("product")
             for reaction_id in reaction_ids:
@@ -192,23 +359,23 @@ class KEGG_ETL:
                         pathway_id=pathway_id
                     ))
                 for substrate in substrates:
-                    entity_id = _require_attr(substrate, "name").removeprefix("cpd:")
-                    _track_compound(entity_id)
-                    reaction_participants.append(ReactionP(
-                        reaction_id=reaction_id,
-                        entity_id=entity_id,
-                        role="substrate",
-                        pathway_id=pathway_id
-                    ))
+                    for entity_id, entity_type in _parse_kegg_refs(_require_attr(substrate, "name")):
+                        _track_compound(entity_id, entity_type)
+                        reaction_participants.append(ReactionP(
+                            reaction_id=reaction_id,
+                            entity_id=entity_id,
+                            role="substrate",
+                            pathway_id=pathway_id
+                        ))
                 for product in products:
-                    entity_id = _require_attr(product, "name").removeprefix("cpd:")
-                    _track_compound(entity_id)
-                    reaction_participants.append(ReactionP(
-                        reaction_id=reaction_id,
-                        entity_id=entity_id,
-                        role="product",
-                        pathway_id=pathway_id
-                    ))
+                    for entity_id, entity_type in _parse_kegg_refs(_require_attr(product, "name")):
+                        _track_compound(entity_id, entity_type)
+                        reaction_participants.append(ReactionP(
+                            reaction_id=reaction_id,
+                            entity_id=entity_id,
+                            role="product",
+                            pathway_id=pathway_id
+                        ))
         return reaction_participants, list(synthesized_entities.values())
 
     def _parse_kgml_to_entry_map(self, xml_content)-> PathwayKGMLRecord:
@@ -220,11 +387,16 @@ class KEGG_ETL:
                         description= _require_attr(pathway_entry, "title"))
         pathway_entity = Entity(entity_id=pathway_id, entity_type=EntityType.PATHWAY)
 
-        entry_map = self._parse_kgml_entries(soup, pathway_id)
+        entry_map, reaction_entities = self._parse_kgml_entries(soup, pathway_id)
         interactions = self._parse_kgml_relations(soup, entry_map, pathway_id)
         reaction_participants, synthesized_entities = self._parse_kgml_reaction_participants(soup, entry_map, pathway_id)
 
-        entities = [entity for kgml_entry in entry_map.values() for entity in kgml_entry.entities] + [pathway_entity] + synthesized_entities
+        entities = (
+            [entity for kgml_entry in entry_map.values() for entity in kgml_entry.entities]
+            + [pathway_entity]
+            + reaction_entities
+            + synthesized_entities
+        )
         entity_path_mem = [epm for kgml_entry in entry_map.values() for epm in kgml_entry.entity_path_mem]
         return PathwayKGMLRecord(pathway, entities, entity_path_mem, interactions, reaction_participants)
 
@@ -278,8 +450,8 @@ class KEGG_ETL:
         Returns a dict mapping KEGG entry codes to parsed metadata.
         Assumes codes are already batched upstream.
         """
-        def preparse(send_url, code_str):
-            response = requests.get(send_url)
+        def preparse(send_url, code_str, expected_count):
+            response = self.kegg_state._get(send_url)
             parsed_data = []
 
             if response.ok:
@@ -290,53 +462,102 @@ class KEGG_ETL:
                         continue
                     parsed = self.parse_kegg_flatfile(entry_text)
                     parsed_data.append(parsed)
+                if len(parsed_data) < expected_count:
+                    # KEGG's /get/ doesn't error on a partial match -- it
+                    # returns 200 with fewer entries than requested (e.g. a
+                    # withdrawn/obsolete id, or a batch over its per-request
+                    # cap). Silently accepting that count mismatch is exactly
+                    # how the batch-size-20 bug above dropped entries with no
+                    # trace, so flag it instead of trusting response.ok alone.
+                    logger.warning(
+                        f"KEGG returned {len(parsed_data)} entries for {expected_count} requested "
+                        f"codes: {code_str}"
+                    )
             else:
                 logger.info(f"Failed to fetch batch: {code_str} — Status: {response.status_code}")
 
             return parsed_data
         def get_prefix(code: str, dtype: str) -> str:
-            if dtype == "compound":
-                if code.startswith("C"):
-                    return "cpd:"
-                elif code.startswith("G"):
-                    return "gl:"
-                elif code.startswith("D"):
-                    return ""
-                else:
-                    raise ValueError(f"Unknown compound-like code: {code}")
-            elif dtype == "reaction":
-                return ""
-            elif dtype == "pathway":
-                return "path:"
-            elif dtype == "gene":
-                return "hsa:"  # Or make species dynamic if needed
-            elif dtype == "ortholog":
-                return "ko:"
-            else:
+            # entity_type now comes from each KGML token's own prefix (see
+            # _parse_kegg_ref), so compound/glycan/drug are already separated
+            # by the time entities reach here -- no need to re-derive it from
+            # the code's leading letter.
+            prefixes = {
+                "compound": "cpd:",
+                "glycan": "gl:",
+                "drug": "dr:",
+                "reaction": "",
+                "pathway": "path:",
+                "gene": "hsa:",  # Or make species dynamic if needed
+                "ortholog": "ko:",
+            }
+            if dtype not in prefixes:
                 raise ValueError(f"Unsupported dtype: {dtype}")
+            return prefixes[dtype]
 
         text_url = self.kegg_state.base_url + "/get/"
         metadata = {}
-        
-        for batch_start in range(0, len(codes), 20):
-            batch_codes = codes[batch_start : batch_start+20]
 
-            # Compose batch URL with correct per-code prefix
+        # KEGG's /get/ silently caps at 10 entries per request -- asking for
+        # more doesn't error, it just returns 200 with only the first 10
+        # entries, dropping the rest with no trace. Confirmed against the
+        # live API: an 11-code request came back with exactly 10 entries.
+        KEGG_GET_BATCH_LIMIT = 10
+        # Bounds concurrency; the actual request pace is capped separately
+        # by kegg_state's shared rate limiter (see _get), so raising this
+        # widens how many batches can be *queued up* waiting on that limiter
+        # rather than how fast requests actually leave the machine. Kept low
+        # to also limit simultaneous open connections to KEGG, which a
+        # abuse-detecting proxy can flag independently of request rate.
+        MAX_WORKERS = 3
+
+        batches = [
+            codes[i : i + KEGG_GET_BATCH_LIMIT]
+            for i in range(0, len(codes), KEGG_GET_BATCH_LIMIT)
+        ]
+
+        def fetch_batch(batch_codes: list[str]) -> list[dict]:
             code_str = "+".join(f"{get_prefix(code, dtype)}{code}" for code in batch_codes)
             send_url = text_url + code_str
-            parsed_entries = preparse(send_url, code_str)
+            return preparse(send_url, code_str, len(batch_codes))
 
-            # Map each parsed entry to its KEGG ID
-            for parsed in parsed_entries:
-                entry_id = parsed.get("ENTRY", "").split()[0]
-                if entry_id=="":
-                    logger.info(f"Missing ENTRY in parsed record: {parsed}")
+        completed = 0
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(fetch_batch, batch): batch for batch in batches}
+            for future in as_completed(futures):
+                completed += 1
+                try:
+                    parsed_entries = future.result()
+                except KEGGBlockedError:
+                    # Do NOT treat like an ordinary failed batch. Cancel
+                    # every not-yet-started future (already-running ones
+                    # can't be interrupted, but this stops queueing more)
+                    # and abort the whole call -- annotation for every
+                    # other entity type must stop too, not just this dtype.
+                    logger.error(
+                        f"KEGG block detected on {dtype} batch {futures[future]} -- "
+                        f"aborting remaining {len(futures) - completed} batch(es)."
+                    )
+                    executor.shutdown(cancel_futures=True)
+                    raise
+                except requests.exceptions.RequestException as e:
+                    # Retries (see _build_kegg_session) are already exhausted
+                    # by this point -- one persistently unreachable batch
+                    # shouldn't take down annotation for every other batch
+                    # that's already succeeded or still in flight.
+                    logger.error(f"Batch {futures[future]} failed after retries: {e}")
+                    continue
 
-                if entry_id:
-                    metadata[entry_id] = parsed
+                for parsed in parsed_entries:
+                    entry_id = parsed.get("ENTRY", "").split()[0]
+                    if entry_id == "":
+                        logger.info(f"Missing ENTRY in parsed record: {parsed}")
 
-            if batch_start % 250==0:
-                logger.info(f'Processing {dtype} from {batch_start}/{len(codes)}')
+                    if entry_id:
+                        metadata[entry_id] = parsed
+
+                if completed % 25 == 0:
+                    logger.info(f"Processing {dtype}: {completed}/{len(batches)} batches")
 
         entity_type = EntityType(dtype)
         modeled_entities = self.data_model_entities(metadata, entity_type)

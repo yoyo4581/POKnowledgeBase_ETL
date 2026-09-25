@@ -77,7 +77,7 @@ table_schemas: dict[str, TableSchema] = {
         key="pathway_id",
         columns = {
             "pathway_id": "VARCHAR(20)",
-            "description": "NVARCHAR(255)",
+            "description": "NVARCHAR(MAX)",
             "class_id": "INT",
         },
         constraints=(
@@ -115,10 +115,31 @@ table_schemas: dict[str, TableSchema] = {
             "compound_id": "VARCHAR(20)",
             "compound_name": "VARCHAR(MAX)",
             "formula": "VARCHAR(MAX)",
-            "compound_synonms": "VARCHAR(MAX)",
+            "compound_synonyms": "VARCHAR(MAX)",
             "MOL_WEIGHT": "NUMERIC(10,2)"
         },
         __table_name__ = "CompoundData"
+    ),
+    "DrugData": TableSchema(
+        key="drug_id",
+        columns={
+            "drug_id": "VARCHAR(20)",
+            "drug_name": "VARCHAR(MAX)",
+            "formula": "VARCHAR(MAX)",
+            "drug_synonyms": "VARCHAR(MAX)",
+            "MOL_WEIGHT": "NUMERIC(10,2)"
+        },
+        __table_name__ = "DrugData"
+    ),
+    "GlycanData": TableSchema(
+        key="glycan_id",
+        columns={
+            "glycan_id": "VARCHAR(20)",
+            "glycan_name": "VARCHAR(MAX)",
+            "composition": "VARCHAR(MAX)",
+            "mass": "NUMERIC(10,2)"
+        },
+        __table_name__ = "GlycanData"
     ),
     "GeneData": TableSchema(
         key="uid",
@@ -142,21 +163,11 @@ table_schemas: dict[str, TableSchema] = {
         key="reaction_id",
         columns={
             "reaction_id": "VARCHAR(20)",
-            "name": "VARCHAR(200)",
+            "name": "NVARCHAR(MAX)",
             "definition": "TEXT",
             "equation": "TEXT",
             "comment": "TEXT",
-            "reaction_type": "VARCHAR(20)",
-            "pathway_id": "VARCHAR(20)"
         },
-        constraints=(
-            ForeignKey(
-                name="r_pathway_id",
-                columns=("pathway_id",),
-                ref_table="PathwayIds",
-                ref_columns=("pathway_id",),
-            ),
-        ),
         __table_name__ = "reactions"
     ),
     "EntrezUniprotMap": TableSchema(
@@ -178,7 +189,7 @@ table_schemas: dict[str, TableSchema] = {
             "last_checked": "DATETIME",
         },
         sync=IdentityHashSync(
-            identity_hash=("etag", "last_modified", "node_count", "edge_count"),
+            identity_hash=("source", "etag", "last_modified", "node_count", "edge_count"),
             coverage_scope_columns=("source",),
         ),
         __table_name__ = "GOOntologyMeta"
@@ -212,7 +223,7 @@ table_schemas: dict[str, TableSchema] = {
     ),
 }
 
-AnnotationTables = Literal["CompoundData", "GeneData", "OrthoData", "PathwayData", "reactions"]
+AnnotationTables = Literal["CompoundData", "GeneData", "OrthoData", "PathwayData", "reactions", "DrugData", "GlycanData"]
 
 
 def _base_type(col_type: str) -> str:

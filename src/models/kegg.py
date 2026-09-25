@@ -11,6 +11,9 @@ class EntityType(str, Enum):
     ORTHOLOG = "ortholog"
     REACTION = "reaction"
     PATHWAY = "pathway"
+    GLYCAN = "glycan"
+    DRUG = "drug"
+
 
 @dataclass(frozen=True)
 class Entity(BaseSQLObject):
@@ -73,7 +76,7 @@ class Compound(BaseSQLObject):
 
     @classmethod
     def from_kegg(cls, datum: dict)-> "Compound":
-        weight = 0
+        weight = 0.0
         formula = 'NA'
         main_name = 'NA'
         synonyms = 'NA'
@@ -103,7 +106,73 @@ class Compound(BaseSQLObject):
             compound_synonyms = synonyms,
             MOL_WEIGHT = weight
         )
-    
+
+@dataclass(frozen=True)
+class Glycan(BaseSQLObject):
+    entity_type: ClassVar[EntityType] = EntityType.GLYCAN
+    glycan_id: str
+    glycan_name: str
+    composition: str
+    mass: float
+    __table_name__: ClassVar[str] = "GlycanData"
+
+    @classmethod
+    def from_kegg(cls, datum: dict) -> "Glycan":
+        mass = 0.0
+        if 'MASS' in datum:
+            mass = round(float(datum['MASS'].split()[0]), 2)
+        return cls(
+            glycan_id=datum['ENTRY'].split()[0],
+            glycan_name=datum.get('NAME', 'undefined'),
+            composition=datum.get('COMPOSITION', 'undefined'),
+            mass=mass
+        )
+
+
+@dataclass(frozen=True)
+class Drug(BaseSQLObject):
+    entity_type: ClassVar[EntityType] = EntityType.DRUG
+    drug_id: str
+    drug_name: str
+    formula: str
+    drug_synonyms: str
+    MOL_WEIGHT: float
+    __table_name__: ClassVar[str] = "DrugData"
+
+    @classmethod
+    def from_kegg(cls, datum: dict) -> "Drug":
+        weight = 0.0
+        formula = 'NA'
+        main_name = 'NA'
+        synonyms = 'NA'
+        id = datum['ENTRY'].split()[0]
+        if 'MOL_WEIGHT' in datum:
+            weight = round(float(datum['MOL_WEIGHT']), 2)
+        elif 'MASS' in datum:
+            weight = round(float(datum['MASS'].split()[0]), 2)
+
+        if 'FORMULA' in datum:
+            formula = datum['FORMULA']
+        elif 'COMPOSITION' in datum:
+            formula = datum['COMPOSITION']
+
+        if 'NAME' in datum:
+            name_data = datum['NAME']
+            names = name_data.split(";")
+            if len(names)>1:
+                synonyms = ';'.join(datum['NAME'].split(';')[1:])
+                main_name = names[0].strip()
+            else:
+                main_name = name_data
+        return cls(
+            drug_id = id,
+            drug_name = main_name,
+            formula = formula,
+            drug_synonyms = synonyms,
+            MOL_WEIGHT = weight
+        )
+
+
 @dataclass(frozen=True)
 class Ortholog(BaseSQLObject):
     entity_type: ClassVar[EntityType] = EntityType.ORTHOLOG    
@@ -136,7 +205,7 @@ class Reaction(BaseSQLObject):
     def from_kegg(cls, datum: dict)-> "Reaction":
         return cls(
             reaction_id=datum['ENTRY'].split()[0],
-            name=datum['NAME', 'undefined'],
+            name=datum.get('NAME', 'undefined'),
             definition=datum['DEFINITION'],
             equation=datum['EQUATION'],
             comment=datum.get('COMMENT', None),
