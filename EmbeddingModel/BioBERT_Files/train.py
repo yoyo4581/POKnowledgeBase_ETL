@@ -371,15 +371,36 @@ if __name__ == "__main__":
     if args.export_only:
         export_dataset(data)
     else:
+        # The export fallback exists for the ETL host, which has no GPU stack:
+        # build the dataset and hand it off rather than dying. It used to wrap
+        # train_and_evaluate() in `except ImportError`, which was far too wide --
+        # ANY ImportError from inside training (a version-pinned kernels package,
+        # a missing CUDA extension) came back as "exporting instead" and exit 0.
+        # A crashed fine-tune reported as a successful export is how you end up
+        # building a Qdrant collection against a model that was never written.
+        # So the check happens up front, and anything that fails during training
+        # now raises.
         try:
+            import datasets            # noqa: F401
+            import sentence_transformers  # noqa: F401
+            import torch               # noqa: F401
+        except ImportError as e:
+            print(f"Training stack not importable ({e}).")
+            if args.from_export:
+                raise SystemExit(
+                    "Refusing to re-export a dataset that was just imported. "
+                    "Install the training stack, or run this where it exists.")
+            print("Exporting the dataset for external training instead.")
+            export_dataset(data)
+        else:
             train_and_evaluate(
                 data,
                 out_dir=args.out_dir,
+                checkpoint_dir=args.checkpoint_dir,
                 batch_size=args.batch_size,
                 epochs=args.epochs,
                 mini_batch_num_tokens=args.mini_batch_num_tokens,
                 max_seq_length=args.max_seq_length,
-                checkpoint_dir=args.checkpoint_dir,
                 learning_rate=args.learning_rate,
                 warmup_ratio=args.warmup_ratio,
                 use_cached_negatives=not args.no_cached_negatives,
@@ -388,6 +409,3 @@ if __name__ == "__main__":
                 metric_for_best_model=args.metric_for_best_model,
                 plot=not args.no_plot,
             )
-        except ImportError as e:
-            print(f"Local fine-tuning unavailable ({e}); exporting the dataset for external training instead.")
-            export_dataset(data)

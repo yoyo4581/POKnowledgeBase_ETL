@@ -36,12 +36,16 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 
-from dotenv import load_dotenv
-
 # Neo4jCaller validates NEO4J_USERNAME/PASSWORD at import time and does not load
 # .env itself -- the DAGs do it for it. This is a standalone entry point, so it
-# has to do the same before that import can succeed.
-load_dotenv()
+# has to do the same before that import can succeed. Optional, because
+# --verify-export reads files only and has to work on Colab, where there is
+# neither a .env nor necessarily python-dotenv.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from EmbeddingModel.BioBERT_Files.dataset import Config
 
