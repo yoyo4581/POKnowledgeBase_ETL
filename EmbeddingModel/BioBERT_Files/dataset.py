@@ -99,9 +99,9 @@ class Config:
     # UniProt function text mostly describes MF and BP, rarely location (CC)
     keep_namespaces: frozenset = frozenset({"molecular_function", "biological_process"})
     blocklist: frozenset = frozenset({"GO_0005515"})  # "protein binding": uninformative
-    min_pos: int = 5        # too few genes -> too few training pairs
-    max_pos: int = 300      # too many -> term is too generic to be a useful query
-    pos_per_anchor: int = 30
+    min_pos: int = 3        # too few genes -> too few training pairs
+    max_pos: int = 150      # too many -> term is too generic to be a useful query
+    pos_per_anchor: int = 50
     p_curated_neg: float = 0.5  # how often to prefer a curated NOT when one exists
     test_frac: float = 0.1
     seed: int = 13

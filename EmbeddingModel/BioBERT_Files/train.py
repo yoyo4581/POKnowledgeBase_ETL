@@ -141,13 +141,15 @@ def train_and_evaluate(
     data: TrainingData,
     base: str = "dmis-lab/biobert-base-cased-v1.2",
     out_dir: str = "biobert-go-retrieval",
+    checkpoint_dir: str | None = None,
     batch_size: int = 256,
     epochs: int = 10,
-    mini_batch_size: int = 32,
+    mini_batch_num_tokens: int = 32768,
     learning_rate: float = 2e-5,
     warmup_ratio: float = 0.1,
     use_cached_negatives: bool = True,
     gradient_checkpointing: bool = False,
+    max_seq_length: int = 512,
     logging_steps: int = 20,
     metric_for_best_model: str = "heldout_go_cosine_ndcg@10",
     plot: bool = True,
@@ -162,9 +164,22 @@ def train_and_evaluate(
     directly by VRAM. CachedMultipleNegativesRankingLoss (default here,
     GradCache) still computes the loss over the full batch -- same
     effective negative count -- but processes the memory-heavy step in
-    mini_batch_size-sized chunks, decoupling negatives (batch_size) from
-    peak VRAM (mini_batch_size). Raise batch_size freely; only lower
-    mini_batch_size if you hit OOM (it costs some speed, not quality).
+    chunks, decoupling negatives (batch_size) from peak VRAM.
+
+    That chunk budget is mini_batch_num_tokens, not a count of examples.
+    With unpad_inputs=True below there is no padding, so a fixed example
+    count would produce chunks of wildly different real size -- function
+    texts run from one sentence to a dozen -- and leave the GPU underfed on
+    the short ones. A token budget makes every chunk the same actual work.
+    GradCache is exact at any chunk size (the gradients do not depend on
+    it), so this is purely a speed/VRAM dial: raise it until you OOM.
+
+    What does NOT make training faster is raising batch_size. The same
+    tokens pass through the model either way, only grouped differently.
+    What it changes is the optimizer-step count -- fewer, so at a fixed
+    learning_rate you undertrain, see below -- and the in-batch negative
+    pool. mini_batch_num_tokens is the speed knob; batch_size is the
+    negatives knob.
 
     learning_rate does NOT auto-scale with batch_size: a bigger batch means
     fewer optimizer steps per epoch (same rows, fewer updates), so raising
@@ -191,7 +206,27 @@ def train_and_evaluate(
     from sentence_transformers.sentence_transformer.evaluation import InformationRetrievalEvaluator
     from sentence_transformers.sentence_transformer.modules import Pooling, Transformer
 
-    word = Transformer(base, max_seq_length=256)
+    # bf16 + flash-attn2 + unpadding. All three need Ampere or newer (compute
+    # capability >= 8.0) -- on a T4 this raises rather than silently falling back,
+    # which is the behaviour we want: a slow run that looks fine is worse.
+    #
+    # max_seq_length is 512 rather than 256 because with unpad_inputs there is no
+    # padding cost to a longer ceiling -- it only decides where truncation starts,
+    # and the corpus has records well past 256 tokens.
+    #
+    # Loading in bfloat16 (torch_dtype) on top of bf16=True below means the
+    # optimizer holds bf16 states rather than fp32 master weights. That is what
+    # the previous model was trained with and it converged; if a future run looks
+    # unstable early, dropping model_kwargs["torch_dtype"] while keeping bf16=True
+    # is the first thing to try.
+    word = Transformer(
+        base,
+        max_seq_length=max_seq_length,
+        model_kwargs={"attn_implementation": "kernels-community/flash-attn2",
+                      "torch_dtype": "bfloat16"},
+        config_kwargs={"attention_probs_dropout_prob": 0.0},
+        unpad_inputs=True,
+    )
     pool = Pooling(word.get_embedding_dimension(), pooling_mode="mean")
     model = SentenceTransformer(modules=[word, pool])
 
@@ -202,12 +237,18 @@ def train_and_evaluate(
 
     train_ds = Dataset.from_list([{k: r[k] for k in ("anchor", "positive", "negative")}
                                   for r in data.rows])
-    loss = (losses.CachedMultipleNegativesRankingLoss(model, mini_batch_size=mini_batch_size)
+    loss = (losses.CachedMultipleNegativesRankingLoss(
+                model, mini_batch_num_tokens=mini_batch_num_tokens)
             if use_cached_negatives else losses.MultipleNegativesRankingLoss(model))
+    # Checkpoints go somewhere other than out_dir on purpose. They are whole
+    # model copies (~440MB each, save_total_limit=2), and out_dir is what gets
+    # zipped and shipped to the ETL host -- keeping them apart means the artifact
+    # is just the model.
+    checkpoint_dir = checkpoint_dir or f"{out_dir}-ckpt"
     args = SentenceTransformerTrainingArguments(
-        output_dir=out_dir, num_train_epochs=epochs,
+        output_dir=checkpoint_dir, num_train_epochs=epochs,
         per_device_train_batch_size=batch_size, learning_rate=learning_rate,
-        warmup_steps=warmup_ratio, fp16=True,        # float in [0,1) = ratio; warmup_ratio was removed in transformers 5
+        warmup_steps=warmup_ratio, bf16=True,        # float in [0,1) = ratio; warmup_ratio was removed in transformers 5
         gradient_checkpointing=gradient_checkpointing,
         batch_sampler=BatchSamplers.NO_DUPLICATES,   # same text can't be pos and neg in one batch
         eval_strategy="epoch", logging_steps=logging_steps,
@@ -230,7 +271,7 @@ def train_and_evaluate(
     if torch.cuda.is_available():
         peak_gb = torch.cuda.max_memory_allocated() / 1e9
         print(f"Peak GPU memory during training: {peak_gb:.2f} GB "
-              f"(batch_size={batch_size}, mini_batch_size={mini_batch_size})")
+              f"(batch_size={batch_size}, mini_batch_num_tokens={mini_batch_num_tokens})")
 
     print("fine-tuned:", evaluator(model))
     model.save(out_dir)
@@ -273,10 +314,20 @@ if __name__ == "__main__":
                              "heldout_go_cosine_map@100, heldout_go_cosine_accuracy@1.")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="Effective batch size = in-batch negatives per anchor (default: 256). "
-                             "Free to raise with --mini-batch-size left alone -- see train_and_evaluate's docstring.")
-    parser.add_argument("--mini-batch-size", type=int, default=32,
-                        help="Chunk size CachedMultipleNegativesRankingLoss processes at once -- the actual "
-                             "VRAM knob. Lower it on OOM; leave --batch-size as the negatives knob (default: 32).")
+                             "Raising it does NOT speed training up -- it changes negatives and step count, "
+                             "not throughput. See train_and_evaluate's docstring.")
+    parser.add_argument("--mini-batch-num-tokens", type=int, default=32768,
+                        help="Token budget per GradCache chunk -- the actual VRAM and SPEED knob "
+                             "(default: 32768). GradCache is exact at any chunk size, so raise this "
+                             "until you OOM; lower it if you already do. A token budget rather than an "
+                             "example count because unpad_inputs means examples have no fixed cost.")
+    parser.add_argument("--max-seq-length", type=int, default=512,
+                        help="Truncation ceiling (default: 512). Free to raise with unpad_inputs -- "
+                             "there is no padding, so short texts cost nothing extra.")
+    parser.add_argument("--checkpoint-dir", default=None,
+                        help="Where HF writes per-epoch checkpoints (default: <out-dir>-ckpt). Kept out "
+                             "of --out-dir so the shipped artifact is only the model, not 2x440MB of "
+                             "checkpoints. On Colab point this at /content/ckpt.")
     parser.add_argument("--learning-rate", type=float, default=2e-5,
                         help="Default: 2e-5. Does NOT auto-scale with --batch-size -- raising batch_size without "
                              "raising this under-trains (fewer optimizer steps/epoch at the same data size); "
@@ -287,8 +338,8 @@ if __name__ == "__main__":
                         help="Use plain MultipleNegativesRankingLoss instead of the GradCache variant "
                              "(couples batch_size to VRAM directly again -- mainly for comparison/debugging).")
     parser.add_argument("--gradient-checkpointing", action="store_true",
-                        help="Trade compute for activation memory. Try this before shrinking --mini-batch-size "
-                             "further if you're still OOMing.")
+                        help="Trade compute for activation memory. Try this before shrinking "
+                             "--mini-batch-num-tokens further if you're still OOMing.")
     parser.add_argument("--out-dir", default="biobert-go-retrieval",
                         help="Where to save the model + training_curves.png (default: biobert-go-retrieval). "
                              "Give each trial its own dir so runs don't overwrite each other's model/plot.")
@@ -326,7 +377,9 @@ if __name__ == "__main__":
                 out_dir=args.out_dir,
                 batch_size=args.batch_size,
                 epochs=args.epochs,
-                mini_batch_size=args.mini_batch_size,
+                mini_batch_num_tokens=args.mini_batch_num_tokens,
+                max_seq_length=args.max_seq_length,
+                checkpoint_dir=args.checkpoint_dir,
                 learning_rate=args.learning_rate,
                 warmup_ratio=args.warmup_ratio,
                 use_cached_negatives=not args.no_cached_negatives,
