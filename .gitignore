@@ -236,3 +236,22 @@ node_modules/
 # added by merge_versions.py
 data/
 password.txt
+
+# --- fine-tuned model artifacts -------------------------------------------
+# The model is trained in Colab and delivered as a zip through
+# data/qdrant/incoming/; qdrant_build.ingest_artifacts then unpacks it to
+# EmbeddingModel/biobert-go-retrieval/, i.e. inside the repo but outside the
+# already-ignored data/ tree. That is 207MB of safetensors -- over GitHub's
+# 100MB per-file hard limit, so a push would be rejected outright -- and it is
+# regenerated on every fine-tune. It travels by Drive and by the release
+# pipeline, never by git.
+biobert-go-retrieval/
+*-ckpt/
+EmbeddingModel/*/eval/
+
+# Net, in case weights land somewhere these paths don't cover.
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.gguf

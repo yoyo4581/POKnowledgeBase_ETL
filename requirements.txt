@@ -1,0 +1,68 @@
+# Environment for the POKnowledgeBase ETL host: Airflow orchestration, the SQL
+# and Neo4j builders, the GO contrastive dataset build, and the Qdrant vector
+# store the MCP toolkit serves from.
+#
+# Pinned from the working venv on 2026-09-26 (Python 3.12.3). These are the
+# direct dependencies; requirements.lock.txt holds the full resolved set,
+# transitive packages included, for exact reproduction.
+#
+#     python3.12 -m venv .venv
+#     .venv/bin/pip install -r requirements.txt
+#
+# This host is CPU-only. Nothing here installs a CUDA build deliberately -- torch
+# arrives with whatever wheel pip picks, and the GPU work (fine-tuning) happens
+# in Colab via Finetune_BioBERT_Colab.ipynb, not here. The `kernels` package that
+# notebook needs for flash-attn2 is deliberately absent: it is Ampere-only and
+# would never load on this machine.
+
+# --- orchestration --------------------------------------------------------
+apache-airflow==3.3.0
+apache-airflow-providers-standard==1.17.0
+apache-airflow-providers-common-sql==2.1.0
+apache-airflow-providers-common-io==1.8.0
+apache-airflow-providers-smtp==3.0.3
+python-dotenv==1.2.2
+
+# --- sources and stores ---------------------------------------------------
+pyodbc==5.3.0                 # SQL Server; needs the system ODBC driver too
+neo4j==6.2.0
+pandas==3.0.5
+numpy==2.5.2
+requests==2.34.2
+urllib3==2.7.0
+beautifulsoup4==4.15.0        # KEGG/UniProt HTML parsing
+lxml==6.1.1
+
+# --- vector store and retrieval -------------------------------------------
+# These three were missing and are why qdrant_collection_build's evaluate_gate
+# died with ModuleNotFoundError: No module named 'qdrant_client'.
+qdrant-client==1.19.1
+mcp==2.2.0                    # evaluate.py drives search THROUGH the MCP server
+#
+# fastembed is pinned exactly, and not to "whatever is current". It supplies the
+# BM25 half of every hybrid query, and `store.py restore` re-derives sparse
+# vectors from payload text rather than shipping them -- which is only equivalent
+# to shipping them while the BM25 hyperparameters match the machine that built
+# the export. check_bm25_params() compares them against the manifest and refuses
+# to run on drift. The current export
+# (data/qdrant/qdrant_export/collection_config.json) records:
+#     bm25_params: k=1.2, b=0.75, avg_len=256.0, english, stemmer on,
+#                  fastembed 0.8.1
+# so this pin is read off the build machine, not chosen. Change it only together
+# with a rebuild, or hybrid search gets quietly worse than what was evaluated.
+fastembed==0.8.1
+
+# --- model: dataset build, drift check, corpus encoding -------------------
+# Inference and the CPU-side InformationRetrievalEvaluator in
+# embedding_drift_check. `datasets` and `accelerate` are only needed if you ever
+# run train.py here rather than on Colab; they are cheap to keep and the
+# training-stack import guard in train.py's __main__ checks for them.
+sentence-transformers==6.0.1
+transformers==5.17.0
+torch==2.14.0
+datasets==5.0.1
+accelerate==1.15.0
+
+# --- notebooks and plots --------------------------------------------------
+matplotlib==3.11.1            # train.py's plot_training_history
+ipykernel==7.3.0              # tester.ipynb, stage_upsert_tester.ipynb

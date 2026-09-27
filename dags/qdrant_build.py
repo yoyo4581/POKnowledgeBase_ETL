@@ -62,11 +62,50 @@ WINDOW = int(os.getenv("QDRANT_WINDOW", "3"))
 STRIDE = int(os.getenv("QDRANT_STRIDE", "2"))
 BATCH_SIZE = int(os.getenv("QDRANT_BATCH_SIZE", "64"))
 
-# The gate. record_hybrid is the default search mode, so it is the arm whose
-# quality actually reaches the application.
+# record_hybrid is the default search mode, so it is the arm whose quality
+# actually reaches the application.
 GATE_METRIC = os.getenv("QDRANT_GATE_METRIC", "ndcg@10")
+# This gate is a TRIPWIRE, not a measurement. Retrieval quality was already
+# measured on the full held-out set during fine-tuning, on a GPU, and recorded
+# in the training log. What is left to establish here is narrower and cruder:
+# that the artifact which actually arrived is not gimped. The failure modes it
+# exists to catch --
+#     the encoder does not match the collections it is querying (the README is
+#       explicit that nothing detects this; results just go quietly poor),
+#     a partially populated or corrupted export,
+#     the wrong model zip dropped in incoming/,
+# -- are not 0.02 regressions. They land the score at roughly raw BioBERT
+# (ndcg@10 ~= 0.05) against a working model's ~0.23 dense-only, higher again
+# once BM25 joins it under record_hybrid. That is a fivefold gap.
+#
+# So the floor sits far below the expected value rather than just under it: low
+# enough that sampling noise can never trip it, high enough that nothing broken
+# survives. Calibrate from your first green run, but keep the margin wide --
+# a gate that cries wolf gets disabled, and then it is guarding nothing.
+GATE_FLOOR = float(os.getenv("QDRANT_GATE_FLOOR", "0.15"))
+
+# The gate reads exactly one number out of evaluate.py: summary[GATE_ARM][ndcg@10].
+# evaluate.py's defaults are the EXPERIMENT's -- both arms and a 100-deep ranking
+# so the paired bootstrap has something to chew on -- and both are wasted here.
+#   --variants <arm>  runs record_hybrid only. chunk_rerank stays the default in
+#                     evaluate.py for interactive use; it is simply not something
+#                     this gate reads, so it is not something this gate pays for.
+#                     (evaluate.py already sends snippets_per_record=0, so with a
+#                     single record-level arm the chunk collection is never
+#                     queried at all.)
+#   --top-k 10        ndcg@10 only looks at the top 10, and top_k also sizes the
+#                     MatchAny accession filter any chunk work would run.
 GATE_ARM = os.getenv("QDRANT_GATE_ARM", "record_hybrid")
-GATE_FLOOR = float(os.getenv("QDRANT_GATE_FLOOR", "0.35"))
+GATE_TOP_K = int(os.getenv("QDRANT_GATE_TOP_K", "10"))
+
+# Subsample by default. Distinguishing 0.05 from 0.25 does not need 651 queries
+# -- at ~150 the standard error on ndcg@10 is around 0.025, so a working model
+# sits several SE clear of the floor and a broken one is nowhere near it.
+# evaluate.py's --limit takes sorted(queries)[:N], i.e. the numerically lowest GO
+# ids, which skew old and general. That bias is irrelevant at this separation and
+# it is deterministic, so run-to-run comparisons still hold. Set 0 for the full
+# set if you ever want the gate's number to be comparable to the training log's.
+GATE_LIMIT = int(os.getenv("QDRANT_GATE_LIMIT", "150")) or None
 
 # Versioned collections kept behind the live one, for rollback.
 KEEP_VERSIONS = int(os.getenv("QDRANT_KEEP_VERSIONS", "2"))
@@ -252,11 +291,19 @@ def qdrant_collection_build():
         if EVAL_DIR.exists():
             shutil.rmtree(EVAL_DIR)
 
-        run_cli(QDRANT_SRC / "analysis" / "evaluate.py",
-                "--data-dir", str(DATASET_DIR),
+        # max(--ks) and --map-k may not exceed --top-k; evaluate.py exits if they do.
+        ks = [k for k in (1, 3, 5, 10) if k <= GATE_TOP_K] or [GATE_TOP_K]
+        argv = ["--data-dir", str(DATASET_DIR),
                 "--model", str(MODEL_DIR),
                 "--storage", str(STORE_DIR),
-                "--out", str(EVAL_DIR))
+                "--out", str(EVAL_DIR),
+                "--variants", GATE_ARM,
+                "--top-k", str(GATE_TOP_K),
+                "--map-k", str(GATE_TOP_K),
+                "--ks", *[str(k) for k in ks]]
+        if GATE_LIMIT:
+            argv += ["--limit", str(GATE_LIMIT)]
+        run_cli(QDRANT_SRC / "analysis" / "evaluate.py", *argv)
 
         results = json.loads((EVAL_DIR / "summary.json").read_text())
         score = results["summary"][GATE_ARM][GATE_METRIC]
