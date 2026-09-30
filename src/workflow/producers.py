@@ -1,4 +1,4 @@
-from src.parsers.KEGGCaller import KEGG_ETL, KEGGBlockedError
+from parsers.KEGG.KEGGCaller import KEGG_ETL, KEGGBlockedError
 from src.parsers.GO.GOCaller import GO_ETL
 from src.parsers.UniProt.UniProtCaller import UniProt_ETL, clean_function_text
 from src.builders.SQL.SQLCaller import SQL_ETL

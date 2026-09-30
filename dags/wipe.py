@@ -5,7 +5,7 @@ from src.workflow.consumers import *
 from src.workflow.producers import *
 
 from src.builders.SQL.SQLCaller import SQL_ETL
-from src.parsers.KEGGCaller import KEGG_ETL
+from parsers.KEGG.KEGGCaller import KEGG_ETL
 import logging
 import os
 

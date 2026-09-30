@@ -58,8 +58,17 @@ MODEL_DIR = Path(os.getenv("BIOBERT_MODEL_PATH",
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-WINDOW = int(os.getenv("QDRANT_WINDOW", "3"))
-STRIDE = int(os.getenv("QDRANT_STRIDE", "2"))
+# These MUST match the notebook's WINDOW/STRIDE. store.py's own argparse defaults
+# are 3/2, but at window=3 the median 3-sentence record collapses into a single
+# chunk identical to itself (55% of the corpus), so the shipped export is built at
+# 2/1. They are only consulted on a LOCAL rebuild; an ingested export carries its
+# own values in the manifest, and restore_to_server warns if the two disagree.
+WINDOW = int(os.getenv("QDRANT_WINDOW", "2"))
+STRIDE = int(os.getenv("QDRANT_STRIDE", "1"))
+# Re-encode even when usable collections are already on disk.
+FORCE_REBUILD = os.getenv("QDRANT_FORCE_REBUILD", "").lower() in ("1", "true", "yes")
+# Move previously-consumed archives back into incoming/ and ingest them again.
+REINGEST = os.getenv("QDRANT_REINGEST", "").lower() in ("1", "true", "yes")
 BATCH_SIZE = int(os.getenv("QDRANT_BATCH_SIZE", "64"))
 
 # record_hybrid is the default search mode, so it is the arm whose quality
@@ -181,6 +190,14 @@ def qdrant_collection_build():
         silently reprocess the same model.
         """
         INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+
+        if REINGEST and ARCHIVE_DIR.is_dir():
+            back = list(ARCHIVE_DIR.glob("*.zip"))
+            for z in back:
+                shutil.move(str(z), str(INCOMING_DIR / z.name))
+            logger.info("QDRANT_REINGEST: moved %d archive(s) back from %s",
+                        len(back), ARCHIVE_DIR)
+
         found = {}
 
         for name, destination in ARTIFACTS.items():
@@ -225,10 +242,50 @@ def qdrant_collection_build():
         Run locally when only the corpus changed and the model did not, which
         is the common case between fine-tunes.
         """
-        if ingested["had_export"] and ingested["had_store"]:
-            logger.info("Colab shipped both the export and the embedded store; "
-                        "not re-encoding.")
+        # Decided from what is ON DISK, not from what arrived this run. The
+        # earlier version keyed off ingested["had_export"], which made a re-run
+        # destructive: ingest_artifacts moves consumed zips to consumed/, so the
+        # second run sees nothing ingested, concludes it must rebuild, deletes
+        # the perfectly good collections Colab produced, and spends tens of CPU
+        # minutes re-encoding 26k texts -- with the local WINDOW/STRIDE, which
+        # need not match the ones the export was built with. Re-running a DAG
+        # must not be destructive.
+        manifest_path = EXPORT_DIR / "collection_config.json"
+        have_export = manifest_path.exists()
+        have_store = STORE_DIR.is_dir() and any(STORE_DIR.iterdir())
+
+        if have_export and have_store and not FORCE_REBUILD:
+            m = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            logger.info("Reusing the collections already on disk -- built %s, "
+                        "model=%s, window=%s/stride=%s, %s records / %s chunks. "
+                        "Set QDRANT_FORCE_REBUILD=1 to re-encode anyway.",
+                        m.get("created"), m.get("model"), m.get("window"),
+                        m.get("stride"), m.get("n_records"), m.get("n_chunks"))
             return {"built_locally": False}
+
+        # The artifacts may be sitting right there, un-ingested. That happens when
+        # only THIS task is cleared instead of the whole DAG run: ingest_artifacts
+        # does not re-run, so build_collections reuses its previous (empty) XCom,
+        # concludes nothing arrived, and starts a tens-of-minutes CPU encode while
+        # the finished collections wait in a zip two directories away. Refuse, and
+        # say which button to press.
+        waiting = sorted(n for n in ARTIFACTS if (INCOMING_DIR / n).exists())
+        if waiting and not FORCE_REBUILD:
+            raise RuntimeError(
+                f"Refusing to re-encode: {', '.join(waiting)} are sitting unconsumed "
+                f"in {INCOMING_DIR}, so ingest_artifacts did not run in this attempt. "
+                f"Clear the DAG run from ingest_artifacts DOWNSTREAM (not this task "
+                f"alone) so the zips get unpacked, or set QDRANT_FORCE_REBUILD=1 to "
+                f"encode locally and leave them where they are.")
+
+        logger.warning(
+            "No usable export+store on disk (export=%s, store=%s)%s -- re-encoding "
+            "the whole corpus locally. That is ~26k texts through BioBERT on CPU "
+            "and takes tens of minutes; it is slow, not hung. If Colab already "
+            "built these, cancel, put the zips back in %s (they are in %s, or set "
+            "QDRANT_REINGEST=1) and re-run instead.",
+            have_export, have_store, " [QDRANT_FORCE_REBUILD]" if FORCE_REBUILD else "",
+            INCOMING_DIR, ARCHIVE_DIR)
 
         if not MODEL_DIR.exists():
             raise RuntimeError(
@@ -242,9 +299,9 @@ def qdrant_collection_build():
                 f"{corpus} is missing -- run embedding_dataset_export first. "
                 f"Despite the name it is the whole corpus, not the held-out slice.")
 
-        # --recreate because both targets are this DAG's own scratch space, not
-        # anything being served. The live collections are only touched by
-        # restore_to_server below, and only via the alias.
+        # Only now, having committed to rebuilding. Both targets are this DAG's
+        # own scratch space, not anything being served -- the live collections are
+        # touched only by restore_to_server below, and only via the alias.
         for path in (STORE_DIR, EXPORT_DIR):
             if path.exists():
                 shutil.rmtree(path)
@@ -346,6 +403,18 @@ def qdrant_collection_build():
         logger.info("Restoring export built %s (model=%s, dim=%s, window=%s/stride=%s) as v%s",
                     manifest["created"], manifest["model"], manifest["dim"],
                     manifest["window"], manifest["stride"], version)
+
+        # restore verifies bm25_params but NOT window/stride, so a divergence
+        # between the shipped export and this host's config is otherwise silent.
+        # It is not fatal here -- the export's own values are what got built --
+        # but it means a later local rebuild would produce different granularity.
+        if (manifest.get("window"), manifest.get("stride")) != (WINDOW, STRIDE):
+            logger.warning(
+                "Export was built at window=%s/stride=%s but this host is "
+                "configured for %s/%s. Restoring the export as-is (its values "
+                "win), but set QDRANT_WINDOW/QDRANT_STRIDE to match, or a local "
+                "rebuild will chunk differently than what was evaluated.",
+                manifest.get("window"), manifest.get("stride"), WINDOW, STRIDE)
 
         sparse_encoder = load_sparse_encoder()
         check_bm25_params(manifest, sparse_encoder)

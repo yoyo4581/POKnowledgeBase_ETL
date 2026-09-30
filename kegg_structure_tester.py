@@ -21,7 +21,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from src.parsers.KEGGCaller import KEGG_ETL
+from parsers.KEGG.KEGGCaller import KEGG_ETL
 from src.models.kegg import Pathway, Entity, EntityPathMem, Interaction, ReactionP, PathwayKGMLRecord
 
 SAMPLE_PATHWAYS = ["hsa04080", "hsa00670", "hsa01523"]

@@ -1,0 +1,147 @@
+# Qdrant server for the protein-function vector store.
+#
+#     docker compose up -d qdrant
+#     curl localhost:6333/readyz
+#
+# This is what qdrant_collection_build's restore_to_server writes into, and what
+# the MCP toolkit serves from. Until it is up, that task fails with
+# "[Errno 111] Connection refused" -- there is no fallback, by design: silently
+# restoring into an embedded folder instead would leave the application querying
+# a store nothing ever promoted into.
+#
+# Pinned to v1.19.1 to match qdrant-client==1.19.1 in requirements.txt. The
+# client tolerates a version skew but warns; keeping them equal removes the
+# question. Bump both together.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST -- core.config.open_client uses prefer_grpc=False
+      - "6334:6334"   # gRPC, for anything that wants it later
+    volumes:
+      # A named volume, not a bind mount into data/. The collections are
+      # reproducible from qdrant_export/ via `store.py restore`, so this is a
+      # cache rather than a source of truth -- and keeping it out of the repo
+      # tree means a stray `git clean` or a data/ wipe cannot take the live
+      # store with it.
+      - qdrant_storage:/qdrant/storage
+    environment:
+      # Structured logs, so an alias flip during restore_to_server is greppable.
+      QDRANT__LOG_LEVEL: INFO
+      QDRANT__SERVICE__ENABLE_TLS: "false"
+      # No API key: this listens on localhost only. If you ever publish the port,
+      # set QDRANT__SERVICE__API_KEY here and QDRANT_API_KEY in .env to match --
+      # the DAG already reads the latter and passes it to open_client().
+    healthcheck:
+      # /readyz rather than /healthz: healthz answers as soon as the process is
+      # alive, readyz waits until collections are actually loadable, which is the
+      # condition restore_to_server needs.
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # --- Neo4j: the serving replica of the graph the ETL builds ---------------
+  #
+  # PERSISTENCE, since that is the whole question: the graph lives in the
+  # neo4j_data named volume, NOT in the dump. Load the dump once; the volume
+  # keeps it across `docker compose stop/start/restart/down` and across reboots.
+  # Only `docker compose down -v` destroys it -- that is the command to never
+  # type by reflex. The loader below is profile-gated precisely so an ordinary
+  # `up` cannot re-import and undo whatever the server has done since.
+  neo4j:
+    image: neo4j:5.19.0-community
+    container_name: neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # HTTP / Browser
+      - "7687:7687"   # Bolt -- point NEO4J_URI at bolt://localhost:7687
+    volumes:
+      - neo4j_data:/data      # <- the database itself. This is the persistence.
+      - neo4j_logs:/logs
+      - ./data/neo4j/dumps:/dumps    # where the snapshot DAG drops neo4j.dump
+    environment:
+      # Only applied when /data is EMPTY. Once the volume has a system database,
+      # this is ignored and the password is whatever it already was -- including
+      # after a dump load, since the dump covers the `neo4j` database and not
+      # `system`. Change it here before the first start, not after.
+      NEO4J_AUTH: neo4j/${NEO4J_CONTAINER_PASSWORD:-changeme-before-first-start}
+      # Community, not Enterprise -- no licence to accept. Confirmed viable:
+      # the source store is record-aligned-1.1 (db.format=aligned), which both
+      # editions read, and every constraint is plain UNIQUENESS. Had Desktop
+      # used Enterprise's default `block` format, or node-key / property-
+      # existence constraints, a load here would have been impossible.
+      # What Community costs: no online backup (`neo4j-admin database backup`),
+      # no database aliases, so no zero-downtime swap like Qdrant's.
+      # _upsert_annotation_edges uses apoc.periodic.iterate, so the ETL cannot
+      # write to this container without APOC. Serving reads do not need it.
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache_size: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  # --- one-shot: import data/neo4j/dumps/neo4j.dump into the volume ---------
+  #
+  #     docker compose stop neo4j
+  #     docker compose --profile load run --rm neo4j-load
+  #     docker compose start neo4j
+  #
+  # The `profiles` key is what keeps this out of a plain `docker compose up`.
+  # Without it, depends_on/service_completed_successfully would re-import the
+  # dump on every single start -- which is exactly the behaviour to avoid.
+  # The server must be stopped: both mount /data and neo4j-admin needs the
+  # store to itself.
+  neo4j-load:
+    profiles: ["load"]
+    image: neo4j:5.19.0-community
+    volumes:
+      - neo4j_data:/data
+      - ./data/neo4j/dumps:/dumps:ro
+    entrypoint:
+      - neo4j-admin
+      - database
+      - load
+      - neo4j                             # the dump must be named neo4j.dump
+      - --from-path=/dumps
+      - --overwrite-destination=true
+      - --verbose
+
+  # --- one-shot: dump the container's graph back out ------------------------
+  #
+  #     docker compose stop neo4j
+  #     docker compose --profile dump run --rm neo4j-dump
+  #     docker compose start neo4j
+  #
+  # Once the ETL writes to this container rather than to Desktop, this is what
+  # the snapshot DAG calls on neo4j://kgml_complete. Enterprise also has
+  # `neo4j-admin database backup`, which runs against a LIVE server over port
+  # 6362 and needs no stop at all -- prefer that if you keep the Enterprise
+  # licence on the SOURCE. Community cannot online-backup, hence the stop.
+  neo4j-dump:
+    profiles: ["dump"]
+    image: neo4j:5.19.0-community
+    volumes:
+      - neo4j_data:/data
+      - ./data/neo4j/dumps:/dumps
+    entrypoint:
+      - neo4j-admin
+      - database
+      - dump
+      - neo4j
+      - --to-path=/dumps
+      - --overwrite-destination=true
+      - --verbose
+
+volumes:
+  qdrant_storage:
+  neo4j_data:
+  neo4j_logs:

@@ -255,3 +255,15 @@ EmbeddingModel/*/eval/
 *.pt
 *.pth
 *.gguf
+
+# Reactome's graph database dump -- 0.5GB, re-downloadable from
+# reactome.org/download/current/, and a read-only staging source rather than
+# anything this repo owns.
+reactome-staging/dumps/*
+!reactome-staging/dumps/.gitkeep
+
+# Reactome prototype scratch: the SBML corpora, resolution caches and the
+# layer1/layer2 reference implementation that src/parsers/Reactome supersedes.
+# MODELING_NOTES.md moved to src/parsers/Reactome/ so the spec ships with the
+# code that cites it.
+reactome-staging/
