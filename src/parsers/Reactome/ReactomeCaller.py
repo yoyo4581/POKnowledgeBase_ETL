@@ -22,6 +22,13 @@ REACTOME_PATH = Path("data/SBML/")
 SPECIES = "9606"
 
 SBML_NS = "http://www.sbml.org/sbml/level3/version1/core"
+# Event-hierarchy node types that are pathways. CellLineagePath is a Pathway
+# subclass in Reactome's schema and nests inside itself, so dropping it would
+# take 14 real pathways and their whole sub-structure with it. Everything
+# absent here -- Reaction, BlackBoxEvent, FailedReaction, Polymerisation,
+# Depolymerisation, CellDevelopmentStep -- is reaction-level and never
+# contains a pathway.
+PATHWAY_TYPES = frozenset({"Pathway", "TopLevelPathway", "CellLineagePath"})
 RDF_RESOURCE = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}resource"
 BQ_NS = "{http://biomodels.net/biology-qualifiers/}"
 
@@ -64,7 +71,12 @@ def _build_reactome_session() -> requests.Session:
         total=5,
         connect=5,
         backoff_factor=1.0,
-        status_forcelist=(429, 500, 502, 503, 504),
+        # 520-527 are Cloudflare's own codes for "the origin misbehaved" --
+        # 521 origin refused the connection, 525 TLS handshake failed. They
+        # are transient and retry clean, but they are not in urllib3's usual
+        # list, so without them one blip drops a pathway for the whole run.
+        status_forcelist=(429, 500, 502, 503, 504,
+                          520, 521, 522, 523, 524, 525, 526, 527),
         allowed_methods=("GET", "POST"),
         respect_retry_after_header=True,
     )
@@ -84,10 +96,11 @@ class Reactome_State:
     and every thread shares one connection pool and one clock."""
 
     _session = _build_reactome_session()
-    # Reactome publishes no rate limit. A full run is ~2,700 pathways and the
+    # Reactome publishes no rate limit. A full run is ~2,000 pathways and the
     # resolve issues a request per 20 entities, so the volume is comparable
     # to what got us soft-blocked elsewhere. Throttled on principle.
     _rate_limiter = _RateLimiter(max_per_second=5)
+    _hierarchy: list[dict] | None = None
 
     def __init__(self):
         self.base_url = "https://reactome.org/ContentService"
@@ -101,21 +114,19 @@ class Reactome_State:
                 "Stop issuing further requests.")
         return response
 
-    def fetch_pathway_ids(self) -> list[dict]:
-        url = f"{self.base_url}/data/pathways/top-level/{SPECIES}"
-        response = self._request("GET", url)
-        if not response.ok:
-            logger.error("Failed to fetch pathway ids - status %d", response.status_code)
-            return []
-        return response.json()
-
     def fetch_event_hierarchy(self) -> list[dict]:
+        """The whole human event tree. Both the pathway registry and the
+        pathway hierarchy come out of this one payload, so it is memoised --
+        it is ~4 MB and two producers read it in the same run."""
+        if self._hierarchy is not None:
+            return self._hierarchy
         url = f"{self.base_url}/data/eventsHierarchy/{SPECIES}"
         response = self._request("GET", url)
         if not response.ok:
             logger.error("Failed to fetch event hierarchy - status %d", response.status_code)
             return []
-        return response.json()
+        self._hierarchy = response.json()
+        return self._hierarchy
 
     def fetch_pathway_sbml(self, pathway_id: str) -> bytes:
         url = f"{self.base_url}/exporter/event/{pathway_id}.sbml"
@@ -170,6 +181,74 @@ class Reactome_State:
             shutil.rmtree(REACTOME_PATH)
 
 
+def _as_dicts(value) -> list[dict]:
+    """A one-or-many Reactome slot, always as a list.
+
+    The ContentService serialises the same slot as a dict when it holds one
+    value and as a list when it holds several, so reading either shape with
+    .get() is a crash waiting for the first instance of the other.
+    """
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, dict)]
+    return []
+
+
+def _residue_moieties(residue: dict) -> list[dict]:
+    """What one modified residue donates: (moiety entity, PSI-MOD) pairs.
+
+    A residue with no `modification` donates nothing, and that is the
+    common case rather than an edge case -- ReplacedResidue (3.4k of them)
+    records a point mutation, "L-alanine 60 replaced with L-glutamic acid",
+    which changes a residue without attaching anything. Those carry two
+    psiMod terms, the residue lost and the residue gained, which is the
+    list shape _as_dicts exists for.
+    """
+    psi = [p["identifier"] for p in _as_dicts(residue.get("psiMod")) if p.get("identifier")]
+    out = []
+    for i, m in enumerate(_as_dicts(residue.get("modification"))):
+        stid = m.get("stId")
+        if not stid:
+            continue
+        psi_mod = psi[i] if i < len(psi) else (psi[0] if psi else None)
+        if str(stid).startswith("R-"):
+            # A protein moiety (SUMO, ubiquitin) is a PhysicalEntity, walked
+            # like any other.
+            out.append({"modification": stid, "ref": None, "psi_mod": psi_mod})
+        elif str(stid).startswith("chebi:") and m.get("identifier"):
+            # A chemical one is a ReferenceMolecule. Every ReferenceEntity
+            # stId is '<prefix>:<accession>' and never R-, so these are not
+            # entities to walk; the node is the compound keyed on the bare
+            # accession, exactly as a SimpleEntity's compound is.
+            out.append({"modification": m["identifier"], "ref": m, "psi_mod": psi_mod})
+        else:
+            logger.warning("moiety modification %r is neither a Reactome entity "
+                           "nor a ChEBI reference - skipped", stid)
+    return out
+
+
+def _walk_pathways(nodes: list[dict], parent_stid: str | None = None
+                   ) -> Iterator[tuple[str, str, bool, str | None]]:
+    """Every pathway in the event hierarchy as (stId, name, is_leaf, parent).
+
+    Emits one tuple per (pathway, parent) arrival, duplicates included --
+    deduping is the caller's job, because the two callers dedupe on
+    different things. A leaf is a pathway with no pathway children; its
+    reaction children are what the SBML export carries.
+    """
+    for node in nodes:
+        children = node.get("children", [])
+        if node.get("type") not in PATHWAY_TYPES:
+            continue
+        stid = node.get("stId")
+        if not stid:
+            continue
+        is_leaf = not any(c.get("type") in PATHWAY_TYPES for c in children)
+        yield stid, node.get("name") or node.get("displayName", ""), is_leaf, parent_stid
+        yield from _walk_pathways(children, stid)
+
+
 def _quals(species: ET.Element) -> dict[str, list[str]]:
     """bqbiol qualifiers on one species, as {qualifier: [db:id, ...]}."""
     out: dict[str, list[str]] = {}
@@ -219,18 +298,40 @@ class Reactome_ETL:
 
     # ---- flat sources -------------------------------------------------
 
-    def parse_pathway_ids(self, payload: list[dict]) -> Iterator[PathwayIds]:
-        for datum in payload:
-            yield PathwayIds(pathway_id=datum["stId"],
-                             name=datum.get("displayName", ""))
+    def parse_pathway_ids(self, nodes: list[dict]) -> Iterator[PathwayIds]:
+        """Leaf pathways -- the ones whose SBML is actually ingested.
 
-    def parse_event_hierarchy(self, nodes: list[dict],
-                              parent_name: str | None = None) -> Iterator[PathwayHierarchy]:
-        """Depth-first parent/child pairs, mirroring KEGG's BRITE flatten."""
-        for node in nodes:
-            name = node.get("name") or node.get("displayName", "")
-            yield PathwayHierarchy(name=name, parent_name=parent_name)
-            yield from self.parse_event_hierarchy(node.get("children", []), parent_name=name)
+        A pathway's SBML export contains every reaction in its subtree, so
+        fetching intermediates too would resolve the same reaction once per
+        ancestor. Ancestry is not lost: pathway_class holds the full DAG
+        above these, so a leaf's parents are one traversal away.
+        """
+        seen: set[str] = set()
+        for stid, name, is_leaf, _ in _walk_pathways(nodes):
+            if is_leaf and stid not in seen:
+                seen.add(stid)
+                yield PathwayIds(pathway_id=stid, name=name)
+
+    def parse_event_hierarchy(self, nodes: list[dict]) -> Iterator[PathwayHierarchy]:
+        """Pathway -> parent edges, keyed by stId.
+
+        Two traps in this feed. It carries every event, and reactions
+        outnumber pathways six to one -- unfiltered it turns a pathway
+        classification into a flattened copy of Reactome. And it is a DAG
+        served as a tree: a pathway reachable under several parents has its
+        whole subtree repeated per parent, so the same (child, parent) pair
+        arrives many times.
+
+        stId, not name, because names are not unique -- ~19k events share
+        ~18.8k names, and matching a parent by name binds some children to
+        the wrong one.
+        """
+        seen: set[tuple[str, str | None]] = set()
+        for stid, name, _, parent_stid in _walk_pathways(nodes):
+            if (stid, parent_stid) in seen:
+                continue
+            seen.add((stid, parent_stid))
+            yield PathwayHierarchy(stid=stid, name=name, parent_stid=parent_stid)
 
     # ---- structure, from the SBML file ---------------------------------
 
@@ -343,24 +444,26 @@ class Reactome_ETL:
         residues = {r["dbId"] for o in resolved.values()
                     for r in (o.get("hasModifiedResidue") or [])
                     if isinstance(r, dict) and r.get("dbId")}
-        moiety_of: dict[int, dict] = {}
+        moiety_of: dict[int, list[dict]] = {}
         if residues:
             todo = sorted(str(d) for d in residues)
             for i in range(0, len(todo), state.QUERY_IDS_MAX):
                 for o in state.query_ids(todo[i:i + state.QUERY_IDS_MAX]):
-                    moiety_of[o.get("dbId")] = {
-                        "modification": (o.get("modification") or {}).get("stId"),
-                        "psi_mod": (o.get("psiMod") or {}).get("identifier"),
-                    }
+                    moiety_of[o.get("dbId")] = _residue_moieties(o)
         for o in resolved.values():
             o["_moieties"] = [
-                moiety_of[r["dbId"]] for r in (o.get("hasModifiedResidue") or [])
-                if isinstance(r, dict) and moiety_of.get(r["dbId"], {}).get("modification")
+                m for r in (o.get("hasModifiedResidue") or [])
+                if isinstance(r, dict)
+                for m in moiety_of.get(r.get("dbId"), [])
             ]
 
         # Moiety entities are usually not components of anything in the
         # pathway, so the walk above never saw them and they carry no genes.
-        frontier = {m["modification"] for o in resolved.values() for m in o["_moieties"]}
+        # Only protein moieties are walked -- a chemical one is a ChEBI
+        # reference, not a Reactome entity, and resolving its pseudo-stId
+        # would put a ReferenceMolecule in the entity table.
+        frontier = {m["modification"] for o in resolved.values()
+                    for m in o["_moieties"] if not m["ref"]}
         while todo := sorted(frontier - resolved.keys() - unresolved):
             for i in range(0, len(todo), state.QUERY_IDS_MAX):
                 chunk = todo[i:i + state.QUERY_IDS_MAX]
@@ -474,6 +577,14 @@ class Reactome_ETL:
             for m in obj.get("_moieties", []):
                 record.moieties.append(EntityMoiety(
                     entity_id=stid, moiety_id=m["modification"], psi_mod=m["psi_mod"]))
+                # A chemical moiety's node is the compound itself, and the
+                # walk never visits it, so register it here or HAS_MOIETY
+                # points at a node nothing created.
+                if m["ref"] and (EntityType.COMPOUND, m["modification"]) not in seen_reference:
+                    seen_reference.add((EntityType.COMPOUND, m["modification"]))
+                    record.entities.append(Entity(entity_id=m["modification"],
+                                                  entity_type=EntityType.COMPOUND))
+                    record.compounds.append(Compound.from_reactome(m["ref"]))
 
             ref = obj.get("referenceEntity") or {}
             identifier, db = ref.get("identifier"), (ref.get("databaseName") or "").lower()

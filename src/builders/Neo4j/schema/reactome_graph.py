@@ -8,7 +8,7 @@ removed independently. Merge with:
     Entity_REGISTRY.update(REACTOME_ENTITY_REGISTRY)
     Edge_REGISTRY.update(REACTOME_EDGE_REGISTRY)
 """
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import ClassVar, Optional
 
 from src.builders.Neo4j.schema.nodes import BaseNeo4jNode
@@ -23,18 +23,49 @@ from src.models.reactome import (
 # nodes
 # --------------------------------------------------------------------------
 
+class _EntityLabelled:
+    """Adds the shared :Entity label to a Reactome node.
+
+    Every structural edge matches its endpoints as (:Entity {id}), because
+    an endpoint can be any of a dozen classes and the edge row never says
+    which -- entity_membership carries two stIds and nothing else. Without
+    a label they all share, those MATCHes find nothing and the MERGE
+    silently creates no relationship, which is how 936k edge rows were
+    "written" into an empty graph.
+
+    MERGE stays on the class label and :Entity is added afterwards.
+    Merging on :Entity instead would match none of the nodes written before
+    this label existed and would create a second copy of every one of them.
+    """
+
+    @classmethod
+    def upsert_cypher(cls, label: str) -> str:
+        return f"""
+        UNWIND $rows AS row
+        MERGE (n:`{label}` {{{cls.__key__}: row.id}})
+        SET n += row.props
+        SET n:Entity
+        """
+
+
 @dataclass
-class Gene(BaseNeo4jNode):
+class Gene(_EntityLabelled, BaseNeo4jNode):
     id: str
     name: str
     full_name: str
     gene_synonym: Optional[str]
+    ensembl_gene: Optional[str] = None
+    # GO annotation matches `row.uniprot_id IN g.uniprot_ids` (OntologyState).
+    # KEGG-keyed Gene nodes got that list from EntrezUniprotMap; a
+    # Reactome-keyed node IS its accession, so the list is [id] and GO
+    # annotation keeps working without touching OntologyState.
+    uniprot_ids: list[str] = field(default_factory=list)
     __label__: ClassVar[str] = "Gene"
     __column_map__: ClassVar[dict[str, str]] = {"uniprot_id": "id", "gene_name": "name"}
 
 
 @dataclass
-class Compound(BaseNeo4jNode):
+class Compound(_EntityLabelled, BaseNeo4jNode):
     id: str
     name: str
     formula: Optional[str]
@@ -44,7 +75,7 @@ class Compound(BaseNeo4jNode):
 
 
 @dataclass
-class Drug(BaseNeo4jNode):
+class Drug(_EntityLabelled, BaseNeo4jNode):
     id: str
     name: str
     drug_type: str
@@ -53,7 +84,7 @@ class Drug(BaseNeo4jNode):
 
 
 @dataclass
-class Reaction(BaseNeo4jNode):
+class Reaction(_EntityLabelled, BaseNeo4jNode):
     id: str
     name: str
     compartment: Optional[str]
@@ -63,7 +94,7 @@ class Reaction(BaseNeo4jNode):
 
 
 @dataclass
-class Pathway(BaseNeo4jNode):
+class Pathway(_EntityLabelled, BaseNeo4jNode):
     id: str
     name: str
     __label__: ClassVar[str] = "Pathway"
@@ -71,7 +102,7 @@ class Pathway(BaseNeo4jNode):
 
 
 @dataclass
-class PhysicalEntity(BaseNeo4jNode):
+class PhysicalEntity(_EntityLabelled, BaseNeo4jNode):
     """One state of a molecule. `WEE1` and `p-WEE1` are two of these, both
     IS_FORM_OF the one Gene -- which is what lets a query be about the gene
     without the graph having lost the state."""
@@ -94,6 +125,7 @@ PHYSICAL_ENTITY_LABELS: dict[EntityType, str] = {
     EntityType.SIMPLE_ENTITY: "SmallMolecule",
     EntityType.OTHER_ENTITY: "OtherEntity",
     EntityType.GENOME_ENCODED: "GenomeEncodedEntity",
+    EntityType.CELL: "Cell",
 }
 
 REACTOME_ENTITY_REGISTRY: dict[EntityType, type[BaseNeo4jNode]] = {
@@ -123,13 +155,29 @@ def build_reactome_node(entity_type: EntityType, data: dict) -> BaseNeo4jNode:
                           compartment=data.get("compartment"), label=label)
 
 
-def build_reactome_annotation(entity_type: EntityType, data: dict) -> BaseNeo4jNode:
-    cls = REACTOME_ENTITY_REGISTRY[EntityType(entity_type)]
+def build_reactome_annotation(entity_type: EntityType, data: dict,
+                              as_physical: bool = False) -> BaseNeo4jNode:
+    """`as_physical` for EntityData, whose rows are per-state physical
+    entities whatever their entity_type says.
+
+    EntityType.DRUG is doing two jobs: it is the identity type for a drug
+    keyed on its Guide-to-Pharmacology accession, and it is also what
+    ChemicalDrug/ProteinDrug/RNADrug map to as physical entities. So 1,083
+    EntityData rows arrive typed `drug` carrying entity_id/display_name,
+    and the Drug identity class wants drug_id/drug_name -- nothing maps and
+    it is constructed with no arguments at all. SimpleEntity does not have
+    this problem: it has its own SIMPLE_ENTITY type, distinct from the
+    COMPOUND identity. The label is unaffected either way, so these still
+    MERGE onto the nodes they already have.
+    """
+    cls = PhysicalEntity if as_physical else REACTOME_ENTITY_REGISTRY[EntityType(entity_type)]
     mapped = {cls.__column_map__.get(k, k): v for k, v in data.items()}
     valid = {f.name for f in fields(cls)}
     filtered = {k: v for k, v in mapped.items() if k in valid}
     if cls is PhysicalEntity:
         filtered["label"] = ENTITY_TYPE_LABELS[EntityType(entity_type).value]
+    if cls is Gene and filtered.get("id"):
+        filtered.setdefault("uniprot_ids", [filtered["id"]])
     return cls(**filtered)
 
 

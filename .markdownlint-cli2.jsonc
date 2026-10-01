@@ -1,0 +1,23 @@
+{
+  // Lint config for the repo's Markdown. Run:
+  //   npx markdownlint-cli2 README.md
+  "config": {
+    "MD013": {
+      // Prose stays wrapped; tables, code fences and long link targets do not
+      // reflow usefully and GitHub scrolls them horizontally anyway.
+      "line_length": 100,
+      "tables": false,
+      "code_blocks": false,
+      "headings": false
+    },
+    // GitHub renders these natively and the README relies on them for the
+    // collapsible UML sections.
+    "MD033": {
+      "allowed_elements": ["details", "summary", "b", "i", "code", "br", "img", "a"]
+    },
+    // The first heading is preceded by badges, which is conventional.
+    "MD041": false
+  },
+  "globs": ["README.md", "docs/**/*.md"],
+  "ignores": ["node_modules", ".venv", "reactome-staging", "EmbeddingModel"]
+}

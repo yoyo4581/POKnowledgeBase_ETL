@@ -6,7 +6,7 @@ from src.workflow.consumers import *
 from src.workflow.producers import *
 
 from src.builders.SQL.SQLCaller import SQL_ETL
-from parsers.KEGG.KEGGCaller import KEGG_ETL
+from src.parsers.KEGG.KEGGCaller import KEGG_ETL
 import logging
 from itertools import chain
 from dotenv import load_dotenv

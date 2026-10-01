@@ -1,25 +1,21 @@
 """
-Reactome table schemas.
+Reactome table schemas -- the source set selected when pathway_source=reactome.
 
-Kept in its own module so `definitions.py` stays untouched; merge with
+The alternative to kegg_definitions.py, not an addition to it: selecting a
+source swaps this whole dict for that one. Source-neutral tables
+(PathwayIds, entities, EntityPathMem, FunctionData, GOOntologyMeta) live in
+shared_definitions.py and are merged in by definitions.py either way.
 
-    from .reactome_definitions import reactome_table_schemas
-    table_schemas.update(reactome_table_schemas)
-
-after the existing dict literal, then `validate_schema(table_schemas)`.
-
-`entities`, `EntityPathMem` and `PathwayIds` are NOT redefined -- their
-columns already take Reactome stIds and UniProt accessions unchanged.
-
-The annotation tables ARE redefined, and the `update()` above is what
-replaces them: KEGG keys GeneData on `uid INT` (Entrez) and gives `reactions`
-a `definition`/`equation` that Reactome has no counterpart for. Since KEGG
-retires, replacing is correct -- but it means the merge order matters and the
-production tables need migrating, not just creating.
+Six names here also exist in the KEGG set -- GeneData, CompoundData,
+DrugData, reactions, PathwayData, reaction_participants -- with different
+shapes. KEGG keys GeneData on `uid INT` (Entrez) and gives `reactions` a
+definition/equation Reactome has no counterpart for. Same table name, other
+schema, so the two sources need separate databases, not a shared one.
 """
+from typing import Literal
+
 from .types import (
-    TableSchema, DiffSync, IdentityHashSync, ForeignKey, UniqueConstraint,
-    DeferredResolution,
+    TableSchema, DiffSync, IdentityHashSync, ForeignKey,
 )
 
 reactome_table_schemas: dict[str, TableSchema] = {
@@ -171,26 +167,22 @@ reactome_table_schemas: dict[str, TableSchema] = {
         ),
         __table_name__="reaction_participants",
     ),
+    # The pathway DAG: one row per (pathway, parent) edge, roots carrying a
+    # NULL parent. ~2,900 edges over ~2,880 pathways.
+    #
+    # Keyed on stId rather than an auto-id matched by name, as kegg_class
+    # was: Reactome event names are not unique, so a name match binds some
+    # children under the wrong parent. With a real id the deferred FK
+    # resolution disappears entirely.
     "pathway_class": TableSchema(
-        key="class_id",
-        auto_id=True,
         columns={
-            "class_id": "INT",
-            "name": "NVARCHAR(255) NOT NULL",
-            "parent_id": "INT NULL",
+            "stid": "VARCHAR(20)",
+            "name": "NVARCHAR(512) NOT NULL",
+            "parent_stid": "VARCHAR(20) NULL",
         },
-        constraints=(
-            ForeignKey(
-                name="fk_pathway_class_parent",
-                columns=("parent_id",),
-                ref_table="pathway_class",
-                ref_columns=("class_id",),
-                deferred=DeferredResolution(
-                    match_columns=("name",),
-                    staging_columns=("parent_name",),
-                ),
-            ),
-            UniqueConstraint(name="uq_pathway_class", columns=("name", "parent_id")),
+        sync=IdentityHashSync(
+            identity_hash=("stid", "parent_stid"),
+            coverage_scope_columns=("stid",),
         ),
         __table_name__="pathway_class",
     ),
@@ -239,17 +231,4 @@ reactome_table_schemas: dict[str, TableSchema] = {
 }
 
 
-# Tables Reactome fills that already exist for KEGG, listed so the overlap is
-# explicit rather than discovered at upsert time. Reactome writes stIds and
-# UniProt accessions into them; the column types already accommodate both.
-SHARED_TABLES = ("entities", "EntityPathMem", "PathwayIds")
-
-# Redefined above; merging replaces the KEGG shape. Production needs a
-# migration, not just a create.
-REPLACED_TABLES = ("GeneData", "CompoundData", "DrugData", "reactions",
-                   "PathwayData", "reaction_participants")
-
-# No Reactome source: Reactome has no ortholog concept, and its glycans are
-# SimpleEntity rows with a ChEBI id, so they land in CompoundData.
-RETIRED_TABLES = ("OrthoData", "GlycanData", "interactions",
-                  "PathwayKGMLMeta", "kegg_class", "EntrezUniprotMap")
+AnnotationTables = Literal["CompoundData", "GeneData", "PathwayData", "reactions", "DrugData", "EntityData"]

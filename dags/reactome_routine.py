@@ -15,14 +15,15 @@ import os
 from itertools import chain
 
 from airflow.exceptions import AirflowSkipException
+from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sdk import Asset, Metadata, dag, task
 from dotenv import load_dotenv
 
 from src.builders.Neo4j.Neo4jCaller import Neo4j_ETL
 from src.builders.SQL.SQLCaller import SQL_ETL
 from src.models.reactome import (
-    Entity, EntityIdentity, EntityMoiety, EntityPathMem, GeneEdge, Membership,
-    Participation,
+    Compound, Drug, Entity, EntityData, EntityIdentity, EntityMoiety,
+    EntityPathMem, Gene, GeneEdge, Membership, Participation, Pathway, Reaction,
 )
 from src.parsers.Reactome.ReactomeCaller import Reactome_ETL
 from src.workflow.reactome_flow import *
@@ -34,6 +35,11 @@ UUID = os.getenv("uuid")
 PATHWAY_SBML_ASSET = Asset("reactome://pathway_sbml_batched")
 REACTOME_STRUCTURE_COMPLETE = Asset("reactome://structure_complete")
 REACTOME_EDGES_COMPLETE = Asset("reactome://gene_edges_complete")
+# The downstream chain (embedding_dataset_export, neo4j_snapshot) listens on
+# this. KEGG's go_ontology_annotation was the only thing emitting it, so
+# retiring that DAG would strand both. Name kept as-is rather than renamed,
+# to avoid editing two DAGs that are otherwise untouched by this migration.
+NEO4J_KG_COMPLETE = Asset("neo4j://kgml_complete")
 
 
 @dag(schedule=None, catchup=False, tags=["reactome"])
@@ -64,11 +70,26 @@ def reactome_meta_build():
         """Fetch every pathway's SBML, hash it, diff, and write only what
         changed to disk -- from bytes already in hand."""
         reactome_caller, sql_caller = Reactome_ETL(), SQL_ETL(run_id=UUID)
-        records = produce_pathway_sbml(reactome_caller, sql_caller)
+        failed: list[str] = []
+        records = produce_pathway_sbml(reactome_caller, sql_caller, failed)
         for changed_ids, bytes_by_id in consume_sbml_meta_data(records, sql_caller):
             for pathway_id in changed_ids:
                 reactome_caller.reactome_state.download_sbml_temp_file(
                     pathway_id, bytes_by_id[pathway_id])
+
+        # A pathway that never got a hash is never resolved, and nothing
+        # downstream can tell the difference between "Reactome dropped it"
+        # and "the fetch failed". Losing a handful to origin blips is
+        # tolerable and self-heals next run, since meta_build re-fetches
+        # every pathway; losing 1% means the corpus is quietly incomplete.
+        total = len(fetch_rows(sql_caller.sql_state, "PathwayIds", kind="dbo"))
+        if failed:
+            logger.error("SBML fetch failed for %d/%d pathways: %s",
+                         len(failed), total, ", ".join(sorted(failed)[:20]))
+            if len(failed) > max(5, total // 100):
+                raise RuntimeError(
+                    f"{len(failed)}/{total} SBML fetches failed - refusing to "
+                    "build on a partial corpus. Re-run once Reactome is healthy.")
 
     @task(outlets=[PATHWAY_SBML_ASSET])
     def detect_and_signal_changes(*, outlet_events):
@@ -76,8 +97,9 @@ def reactome_meta_build():
         sql_caller = SQL_ETL(run_id=UUID)
         changed_ids: set[str] = set()
         for table_name in ("PathwayIds", "PathwaySBMLMeta"):
-            diff_rows = sql_caller.sql_state.fetch_data(table_name, kind="diff") or []
-            changed_ids.update(row["pathway_id"] for batch in diff_rows for row in batch)
+            changed_ids.update(
+                row["pathway_id"]
+                for row in fetch_rows(sql_caller.sql_state, table_name, kind="diff"))
         logger.info("Pathways requiring re-resolution: %s", len(changed_ids))
         if changed_ids:
             yield Metadata(PATHWAY_SBML_ASSET, {"changed_ids": sorted(changed_ids)})
@@ -99,7 +121,7 @@ def reactome_structure():
         They are nodes like any other, so the entities diff covers them.
         """
         reactome_caller, sql_caller = Reactome_ETL(), SQL_ETL(run_id=UUID)
-        pathway_ids = _changed_ids(triggering_asset_events)
+        pathway_ids = _changed_ids(triggering_asset_events, PATHWAY_SBML_ASSET)
         records = chain.from_iterable(
             produce_pathway_record(pathway_id, reactome_caller)
             for pathway_id in pathway_ids)
@@ -111,42 +133,130 @@ def reactome_structure():
         diffed = sql_caller.sql_state.fetch_diff_entities(table_name=Entity.__table_name__)
         logger.info(consume_reactome_nodes(diffed, neo4j_caller))
 
+    @task()
+    def annotate_nodes_neo4j():
+        """Properties onto the nodes structure created.
+
+        Separate from structure on the Neo4j side even though SQL writes
+        both in one parse: the two diffs are independent, and diff.entities
+        holds only the key, so a node's name can only come from here.
+        """
+        sql_caller, neo4j_caller = SQL_ETL(run_id=UUID), Neo4j_ETL()
+        # EntityData spans every physical-entity class, so its type comes
+        # from the entities join -- and its key IS entity_id, so that join
+        # is 1:1 rather than the fan-out an edge table would get.
+        diffed = sql_caller.sql_state.fetch_diff_entities(
+            table_name=EntityData.__table_name__)
+        logger.info(consume_reactome_annotations(diffed, neo4j_caller, as_physical=True))
+
+        for model in (Gene, Compound, Drug, Reaction, Pathway):
+            diffed = fetch_diff_annotated(sql_caller.sql_state, model.__table_name__)
+            logger.info({model.__table_name__: consume_reactome_annotations(
+                diffed, neo4j_caller, model.entity_type)})
+
     @task(outlets=[REACTOME_STRUCTURE_COMPLETE])
     def structure_edges_neo4j():
         sql_caller, neo4j_caller = SQL_ETL(run_id=UUID), Neo4j_ETL()
         for table in (EntityPathMem.__table_name__, EntityIdentity.__table_name__,
                       Membership.__table_name__, Participation.__table_name__,
                       EntityMoiety.__table_name__):
-            diffed = sql_caller.sql_state.fetch_diff_entities(table_name=table)
+            diffed = fetch_diff_batches(sql_caller.sql_state, table)
             logger.info(consume_reactome_edges(diffed, table, neo4j_caller))
 
-    resolve_structure() >> structure_nodes_neo4j() >> structure_edges_neo4j()
+    (resolve_structure() >> structure_nodes_neo4j() >> annotate_nodes_neo4j()
+     >> structure_edges_neo4j())
 
 
-@dag(schedule=[REACTOME_STRUCTURE_COMPLETE], catchup=False, tags=["reactome", "neo4j"])
+@dag(schedule=[REACTOME_STRUCTURE_COMPLETE], catchup=False,
+     params={"full_rebuild": False}, tags=["reactome", "neo4j"])
 def reactome_gene_edges():
 
     @task()
-    def derive_edges(triggering_asset_events=None):
+    def derive_edges(params=None):
         """Layer 2, read back out of SQL rather than re-parsed -- so the
-        projection is provably derived from the graph being served."""
+        projection is provably derived from the graph being served.
+
+        Diff-driven, like KEGG's annotate_from_diff: only the first stage of
+        a chain can carry changed_ids on its asset, because nothing
+        downstream of it knows them. Reading REACTOME_STRUCTURE_COMPLETE for
+        a `changed_ids` it never carries is how this task silently skipped
+        every run.
+
+        Set the `full_rebuild` param to recompute every pathway -- needed
+        after a rule change, since an edge that a rule stops producing is
+        only retracted for pathways this task actually revisits.
+        """
         reactome_caller, sql_caller = Reactome_ETL(), SQL_ETL(run_id=UUID)
-        pathway_ids = _changed_ids(triggering_asset_events, asset=PATHWAY_SBML_ASSET)
-        records = chain.from_iterable(
-            produce_gene_edges(pathway_id, sql_caller, reactome_caller)
-            for pathway_id in pathway_ids)
+        pathway_ids = _pathways_to_reproject(sql_caller, (params or {}).get("full_rebuild"))
+        if not pathway_ids:
+            raise AirflowSkipException("No pathway structure changed")
+        # One list per pathway, NOT chain.from_iterable: the staging batch
+        # boundary has to fall between pathways, or the coverage-scoped
+        # delete retracts edges a previous batch just wrote.
+        records = produce_gene_edges(pathway_ids, sql_caller, reactome_caller)
         logger.info(consume_gene_edges(records, sql_caller))
 
     @task(outlets=[REACTOME_EDGES_COMPLETE])
     def edges_to_neo4j():
         sql_caller, neo4j_caller = SQL_ETL(run_id=UUID), Neo4j_ETL()
-        diffed = sql_caller.sql_state.fetch_diff_entities(table_name=GeneEdge.__table_name__)
+        diffed = fetch_diff_batches(sql_caller.sql_state, GeneEdge.__table_name__)
         logger.info(consume_reactome_edges(diffed, GeneEdge.__table_name__, neo4j_caller))
 
     derive_edges() >> edges_to_neo4j()
 
 
-def _changed_ids(triggering_asset_events, asset: Asset = PATHWAY_SBML_ASSET) -> set[str]:
+@dag(schedule=[REACTOME_EDGES_COMPLETE], catchup=False, tags=["reactome", "go"])
+def reactome_ontology_annotation():
+    """GO annotation over the finished graph, and the tail of the chain.
+
+    Mirrors KEGG's go_ontology_annotation minus the entrez_uniprot_annotation
+    hop: that existed only to hang a uniprot_ids property on Entrez-keyed Gene
+    nodes, and a Reactome Gene node already is its accession.
+    """
+
+    refresh_ontology = TriggerDagRunOperator(
+        task_id="refresh_ontology",
+        trigger_dag_id="go_ontology_network",
+        wait_for_completion=True,
+        reset_dag_run=True,
+    )
+
+    @task(outlets=[NEO4J_KG_COMPLETE])
+    def annotate_ontologies():
+        from src.parsers.GO.GOCaller import GO_ETL
+        go_caller, neo4j_caller = GO_ETL(), Neo4j_ETL()
+        if go_caller.fetch_latest_go_file(file_type="goa"):
+            logger.info("GOA file updated, re-annotating ontology edges.")
+            neo4j_caller.ontology_manager.sync_ontology_annotations(
+                go_caller.read_annotation(), batch_size=10000)
+        else:
+            logger.info("GOA unchanged; ontology edges left as they are.")
+
+    refresh_ontology >> annotate_ontologies()
+
+
+def _pathways_to_reproject(sql_caller: SQL_ETL, full_rebuild: bool = False) -> set[str]:
+    """Pathways whose derived edges need recomputing.
+
+    Only tables carrying a pathway_id can scope this. An identity or moiety
+    change on an entity in an otherwise-unchanged pathway is therefore NOT
+    caught -- rare, since Reactome re-annotating an entity usually moves the
+    entity too, but `full_rebuild` is the answer when it matters.
+    """
+    if full_rebuild:
+        return {r["pathway_id"]
+                for r in fetch_rows(sql_caller.sql_state, "PathwayIds", kind="dbo")}
+
+    changed: set[str] = set()
+    for table in (Membership.__table_name__, Participation.__table_name__,
+                  EntityPathMem.__table_name__):
+        changed.update(r["pathway_id"]
+                       for r in fetch_rows(sql_caller.sql_state, table, kind="diff")
+                       if r.get("pathway_id"))
+    return changed
+
+
+def _changed_ids(triggering_asset_events, asset: Asset) -> set[str]:
     if not triggering_asset_events:
         raise AirflowSkipException("No trigger asset events")
     events = triggering_asset_events.get(asset, {})
@@ -161,3 +271,4 @@ def _changed_ids(triggering_asset_events, asset: Asset = PATHWAY_SBML_ASSET) -> 
 reactome_meta_build()
 reactome_structure()
 reactome_gene_edges()
+reactome_ontology_annotation()

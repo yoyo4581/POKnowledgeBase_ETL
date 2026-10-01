@@ -30,6 +30,7 @@ class EntityType(str, Enum):
     SIMPLE_ENTITY = "simple_entity"
     OTHER_ENTITY = "other_entity"
     GENOME_ENCODED = "genome_encoded_entity"
+    CELL = "cell"                   # a cell type, in the lineage pathways
 
     # events
     REACTION = "reaction"
@@ -45,6 +46,7 @@ SCHEMA_CLASS_TO_ENTITY_TYPE: dict[str, EntityType] = {
     "SimpleEntity": EntityType.SIMPLE_ENTITY,
     "OtherEntity": EntityType.OTHER_ENTITY,
     "GenomeEncodedEntity": EntityType.GENOME_ENCODED,
+    "Cell": EntityType.CELL,
     "ChemicalDrug": EntityType.DRUG,
     "ProteinDrug": EntityType.DRUG,
     "RNADrug": EntityType.DRUG,
@@ -53,9 +55,18 @@ SCHEMA_CLASS_TO_ENTITY_TYPE: dict[str, EntityType] = {
     "Polymerisation": EntityType.REACTION,
     "Depolymerisation": EntityType.REACTION,
     "FailedReaction": EntityType.REACTION,
+    "CellDevelopmentStep": EntityType.REACTION,
     "Pathway": EntityType.PATHWAY,
     "TopLevelPathway": EntityType.PATHWAY,
+    "CellLineagePath": EntityType.PATHWAY,
 }
+# Complete as of the 2026-09 release, checked against Reactome's own counts
+# rather than against what the test corpora happened to contain:
+#   Event  = Pathway 2,883 + ReactionLikeEvent 16,423 = 19,306, the reported
+#            total, so no event subclass is missing.
+#   EntitySet = DefinedSet 3,826 + CandidateSet 1,395 = 5,221, the reported
+#            total -- OpenSet no longer exists in the schema.
+# Reactome does add classes, which is why entity_type_of raises.
 
 
 def entity_type_of(schema_class: str) -> EntityType:
@@ -364,9 +375,14 @@ class PathwayIds(BaseSQLObject):
 
 @dataclass(frozen=True)
 class PathwayHierarchy(BaseSQLObject):
-    """Reactome's event hierarchy, depth-first parent/child pairs."""
+    """One pathway -> parent edge in Reactome's event hierarchy.
+
+    An edge, not a node: the hierarchy is a DAG, so a pathway with two
+    parents is two rows. A root has parent_stid None.
+    """
+    stid: str
     name: str
-    parent_name: Optional[str]
+    parent_stid: Optional[str]
     __table_name__: ClassVar[str] = "pathway_class"
 
 

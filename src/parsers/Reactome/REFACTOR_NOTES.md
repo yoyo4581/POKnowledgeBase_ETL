@@ -60,7 +60,7 @@ used the symbol as the key. Symbol becomes a node property, not an identity.
 ```
 Reactome_State       pure I/O. Session + limiter as CLASS attrs so every
                      instance and thread shares one clock.
-                     fetch_pathway_ids · fetch_pathway_sbml · query_ids ·
+                     fetch_event_hierarchy · fetch_pathway_sbml · query_ids ·
                      download_sbml_temp_file · compute_sbml_hash ·
                      read_sbml_temp_file · cleanup_sbml_temp_files
 Reactome_ETL         owns the state; all parsing lives here as parse_*
@@ -324,7 +324,7 @@ before treating one as an IP block.
 
 - **Ortholog and Glycan** retire, unless you want the tables kept.
 - **Rate limiting the ContentService.** Nothing published. Five pathways ran
-  unthrottled at batches of 20 without a refusal; a full run is ~2,700, so I
+  unthrottled at batches of 20 without a refusal; a full run is ~2,000, so I
   would put KEGG's `_RateLimiter` in front of it anyway.
 - **Import path** — `from parsers.KEGG…` vs `from src.parsers.GO…`. Pick one;
   I will use `src.parsers.Reactome` unless told otherwise.

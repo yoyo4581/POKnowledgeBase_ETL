@@ -74,6 +74,7 @@ PHYSICAL_ENTITY_TYPES = (
     EntityType.SIMPLE_ENTITY,
     EntityType.OTHER_ENTITY,
     EntityType.GENOME_ENCODED,
+    EntityType.CELL,
 )
 
 for _entity_type in PHYSICAL_ENTITY_TYPES:

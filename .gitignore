@@ -267,3 +267,4 @@ reactome-staging/dumps/*
 # MODELING_NOTES.md moved to src/parsers/Reactome/ so the spec ships with the
 # code that cites it.
 reactome-staging/
+notes.txt

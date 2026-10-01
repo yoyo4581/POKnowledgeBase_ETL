@@ -11,7 +11,7 @@ from pathlib import Path
 import logging
 
 from src.models.kegg import *
-from parsers.KEGG.KEGGEntityFactory import KEGGEntityFactory
+from src.parsers.KEGG.KEGGEntityFactory import KEGGEntityFactory
 
 
 logger = logging.getLogger(__name__)
