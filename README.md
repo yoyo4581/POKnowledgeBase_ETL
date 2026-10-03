@@ -593,7 +593,7 @@ bind some children to the wrong parent.
 | `CompoundData` | `DiffSync` | `SQLStageUpsertDiff` | 1,818 |
 | `DrugData` | `DiffSync` | `SQLStageUpsertDiff` | 975 |
 | `entity_moiety` | `IdentityHashSync` | `SQLStageUpsertDiff` | 501 |
-| `gene_edges` | `IdentityHashSync` | `SQLStageUpsertDiff` | *rebuilding* |
+| `gene_edges` | `IdentityHashSync` | `SQLStageUpsertDiff` | 142547 |
 | `FunctionData` | `DefaultSync` | `SQLStageUpsert` | — |
 | `GOOntologyMeta` | `IdentityHashSync` | `SQLStageUpsertDiff` | 0 |
 
