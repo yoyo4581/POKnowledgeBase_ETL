@@ -1,0 +1,5 @@
+# Tracked on purpose, to keep this directory present in a fresh clone.
+# See data/qdrant/snapshots/.gitkeep -- same reason: a bind source Docker
+# would otherwise create as root, breaking neo4j-admin's write to /dumps.
+#
+# neo4j.dump goes here. Gitignored; fetch it from the matching release.

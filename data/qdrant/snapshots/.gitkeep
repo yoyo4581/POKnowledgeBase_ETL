@@ -1,0 +1,9 @@
+# Tracked on purpose, to keep this directory present in a fresh clone.
+#
+# docker-compose.yml bind-mounts it into qdrant-load. Docker creates a missing
+# bind source as root, and then nothing but root can write here -- which is how
+# a snapshot restore fails with a permission error nobody expects. An existing
+# directory is owned by whoever cloned the repo, so the problem never arises.
+#
+# Shipped *.snapshot files go here. They are gitignored; fetch them from the
+# release that matches your checkout.

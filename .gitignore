@@ -268,3 +268,5 @@ reactome-staging/dumps/*
 # code that cites it.
 reactome-staging/
 notes.txt
+# Ship the template, never the real thing.
+!.env.example
