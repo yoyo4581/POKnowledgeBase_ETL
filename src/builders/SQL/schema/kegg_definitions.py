@@ -159,19 +159,10 @@ kegg_table_schemas: dict[str, TableSchema] = {
         },
         __table_name__ = "reactions"
     ),
-    "EntrezUniprotMap": TableSchema(
-        key=PrimaryCompositeKey(("entrez_id", "uniprot_id")),
-        columns={
-            "entrez_id": "INT",
-            "uniprot_id": "VARCHAR(20)",
-        },
-        sync=CompositeKeySync(coverage_scope_columns=("entrez_id",)),
-        __table_name__ = "EntrezUniprotMap"
-    ),
     "reaction_participants": TableSchema(
         columns={
             "reaction_id": "VARCHAR(20)",
-            "entity_id": "VARCHAR(20)",
+            "entity_id": "VARCHAR(40)",
             "role": "VARCHAR(20)",
             "pathway_id": "VARCHAR(20)"
         },

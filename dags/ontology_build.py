@@ -5,6 +5,7 @@ from src.workflow.consumers import *
 from src.workflow.producers import *
 
 from src.builders.SQL.SQLCaller import SQL_ETL
+from src.builders.SQL.schema import pathway_source
 from src.builders.Neo4j.Neo4jCaller import Neo4j_ETL
 from src.parsers.GO.GOCaller import GO_ETL
 from src.parsers.UniProt.UniProtCaller import UniProt_ETL
@@ -71,24 +72,55 @@ def go_ontology_network():
 )
 def entrez_uniprot_annotation():
     """
-    Owns the entrez_id -> uniprot_id crosswalk end to end: refreshes
-    dbo.EntrezUniprotMap from UniProt's idmapping file, then pushes each
-    gene's full current uniprot_id list onto its Neo4j Gene node. Triggered
-    synchronously by go_ontology_annotation before it annotates GO edges,
-    since that step matches genes by uniprot_id -- a Gene node with no
-    uniprot_ids property can never receive an annotation edge.
+    Owns the entrez_id <-> uniprot_id crosswalk end to end: refreshes
+    dbo.EntrezUniprotMap from UniProt's idmapping file, then pushes the
+    other id form onto every Neo4j Gene node.
+
+    Which direction depends on how the active source keys a Gene:
+
+      kegg      Gene.id is an entrez id, so the node gets `uniprot_ids`.
+                Triggered synchronously by go_ontology_annotation before it
+                annotates GO edges, since that step matches genes by
+                uniprot_id -- a Gene node with no uniprot_ids property can
+                never receive an annotation edge.
+
+      reactome  Gene.id is the accession, which already carries uniprot_ids
+                = [id] from structural sync, so GO annotation needs nothing
+                from here. The node gets `entrez_ids` instead -- a lookup
+                qualifier, so a caller holding an entrez id can still reach
+                the gene, and so the same id can ride down to the Qdrant
+                record payload (see embedding_dataset.export_training_dataset).
+
+    Either way the table itself is identical and source-independent, which
+    is why it lives in shared_definitions.
     """
 
     @task()
     def sync_entrez_uniprot_map():
-        """Refreshes dbo.EntrezUniprotMap from UniProt's idmapping file."""
+        """
+        Refreshes dbo.EntrezUniprotMap from UniProt's idmapping file.
+
+        The "has the file changed" cache is about the file, not about this
+        database, and those come apart: the download cache can say unchanged
+        while dbo.EntrezUniprotMap is absent or empty here -- exactly what
+        happens the first time a new gene_database is pointed at an already
+        downloaded idmapping file. Skipping then would leave the downstream
+        annotate task querying a table that does not exist. So the table's
+        own state is checked first and wins.
+        """
         uniprot_caller = UniProt_ETL()
-
-        if not uniprot_caller.has_idmapping_changed():
-            raise AirflowSkipException("idmapping file unchanged, skipping EntrezUniprotMap update.")
-
         sql_caller = SQL_ETL(run_id=UUID)
-        records = produce_entrez_uniprot_map(uniprot_caller)
+
+        existing = sql_caller.sql_state.row_count("EntrezUniprotMap")
+        if existing and not uniprot_caller.has_idmapping_changed():
+            raise AirflowSkipException(
+                f"idmapping file unchanged and dbo.EntrezUniprotMap already holds "
+                f"{existing} rows; skipping update.")
+        if not existing:
+            logger.info("dbo.EntrezUniprotMap is empty or absent in this database; "
+                        "populating it regardless of the download cache.")
+
+        records = produce_entrez_uniprot_map(uniprot_caller, use_cached=not existing)
         if not records:
             raise AirflowSkipException("No EntrezUniprotMap records produced.")
 
@@ -96,24 +128,32 @@ def entrez_uniprot_annotation():
         logger.info(staged_result)
 
     @task(trigger_rule="all_done")
-    def annotate_gene_uniprot_ids():
+    def annotate_gene_ids():
         """
         Always pushes the FULL current dbo.EntrezUniprotMap to Neo4j
         Gene nodes, regardless of whether sync_entrez_uniprot_map ran or
         was skipped above (trigger_rule="all_done") -- a Gene node can be
         newly structurally synced since the last time this ran even when
         the mapping file itself hasn't changed, and it still needs its
-        (already-known, unchanged) uniprot_ids pushed to it.
+        (already-known, unchanged) ids pushed to it.
+
+        The direction follows pathway_source, never the presence of the
+        table: EntrezUniprotMap is shared by both sources now, so its
+        presence no longer distinguishes them.
         """
         sql_caller = SQL_ETL(run_id=UUID)
         neo4j_caller = Neo4j_ETL()
 
-        batches = produce_gene_uniprot_annotations(sql_caller)
-        result = consume_gene_uniprot_annotations(batches, neo4j_caller)
+        if pathway_source == "kegg":
+            batches = produce_gene_uniprot_annotations(sql_caller)
+            result = consume_gene_uniprot_annotations(batches, neo4j_caller)
+        else:
+            batches = produce_gene_entrez_annotations(sql_caller)
+            result = consume_gene_entrez_annotations(batches, neo4j_caller)
         logger.info(result)
 
     sync = sync_entrez_uniprot_map()
-    annotate = annotate_gene_uniprot_ids()
+    annotate = annotate_gene_ids()
 
     sync >> annotate
 
@@ -134,8 +174,9 @@ def function_data_build():
     it's driven by diff.entities instead: a gene goes through function
     annotation again whenever its entities row changed, the same
     structural-change trigger kgml_entity_annotation.annotate_from_diff
-    uses for its own annotation tables, joined to UniProt ids through
-    dbo.EntrezUniprotMap.
+    uses for its own annotation tables. Under KEGG that reaches UniProt
+    through dbo.EntrezUniprotMap; under Reactome the entity_id already IS
+    the accession and no crosswalk is involved (SQLState.fetch_diff_gene_uniprot_ids).
     """
 
     @task()

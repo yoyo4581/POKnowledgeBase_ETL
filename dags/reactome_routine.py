@@ -13,6 +13,7 @@ Refactor plan:   src/parsers/Reactome/REFACTOR_NOTES.md.
 import logging
 import os
 from itertools import chain
+from typing import get_args
 
 from airflow.exceptions import AirflowSkipException
 from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
@@ -21,6 +22,7 @@ from dotenv import load_dotenv
 
 from src.builders.Neo4j.Neo4jCaller import Neo4j_ETL
 from src.builders.SQL.SQLCaller import SQL_ETL
+from src.builders.SQL.schema import AnnotationTables
 from src.models.reactome import (
     Compound, Drug, Entity, EntityData, EntityIdentity, EntityMoiety,
     EntityPathMem, Gene, GeneEdge, Membership, Participation, Pathway, Reaction,
@@ -137,22 +139,32 @@ def reactome_structure():
     def annotate_nodes_neo4j():
         """Properties onto the nodes structure created.
 
-        Separate from structure on the Neo4j side even though SQL writes
-        both in one parse: the two diffs are independent, and diff.entities
-        holds only the key, so a node's name can only come from here.
+        Driven by diff.entities through load_from_diff, not by a diff on
+        each annotation table. An annotation table holds one row per
+        entity, so its key IS an entity_id -- GeneData is keyed on the
+        accession that `entities` stores for that gene, EntityData on the
+        stId, CompoundData on the ChEBI id. One change signal covers all
+        of them, and the join carries entity_type along for the label.
+
+        That is also why these tables are DefaultSync: with a single row
+        per entity the MERGE converges on its own, and comparing columns
+        to decide whether to write adds nothing -- while `<>` silently
+        misses every NULL-to-value transition.
         """
         sql_caller, neo4j_caller = SQL_ETL(run_id=UUID), Neo4j_ETL()
-        # EntityData spans every physical-entity class, so its type comes
-        # from the entities join -- and its key IS entity_id, so that join
-        # is 1:1 rather than the fan-out an edge table would get.
-        diffed = sql_caller.sql_state.fetch_diff_entities(
-            table_name=EntityData.__table_name__)
-        logger.info(consume_reactome_annotations(diffed, neo4j_caller, as_physical=True))
-
-        for model in (Gene, Compound, Drug, Reaction, Pathway):
-            diffed = fetch_diff_annotated(sql_caller.sql_state, model.__table_name__)
-            logger.info({model.__table_name__: consume_reactome_annotations(
-                diffed, neo4j_caller, model.entity_type)})
+        for table in get_args(AnnotationTables):
+            # EntityData rows are physical entities whatever entity_type
+            # says; EntityType.DRUG doubles as an identity type, so without
+            # this the 1,083 drug entities build as drug identities.
+            physical = table == EntityData.__table_name__
+            try:
+                diffed = sql_caller.sql_state.load_from_diff(table_name=table)
+                logger.info({table: consume_reactome_annotations(
+                    diffed, neo4j_caller, as_physical=physical)})
+            except ValueError as e:
+                if not str(e).startswith("Empty data table"):
+                    raise
+                logger.info("%s: nothing changed", table)
 
     @task(outlets=[REACTOME_STRUCTURE_COMPLETE])
     def structure_edges_neo4j():

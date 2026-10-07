@@ -66,14 +66,26 @@ class Settings:
         )
 
 
-def open_client(storage: str | None = None, url: str | None = None, api_key: str | None = None):
-    """Embedded folder or server, never both -- ambiguity here is always a config bug."""
+def open_client(storage: str | None = None, url: str | None = None, api_key: str | None = None,
+                timeout: int | None = None):
+    """
+    Embedded folder or server, never both -- ambiguity here is always a config bug.
+
+    timeout is seconds for a single HTTP request, and matters more than it
+    looks: qdrant-client defaults to FIVE, which is ample for a query and not
+    for an administrative call. Snapshotting the chunk collection takes ~4s on
+    an idle server and longer on one still flushing a fresh restore, so it
+    fails intermittently at the default -- passing once and then timing out on
+    an identical collection. Pass a generous value for anything that is not a
+    query; there is no cost to a timeout that is never reached.
+    """
     from qdrant_client import QdrantClient
 
     if url and storage:
         raise ValueError("Pass either a storage path (embedded) or a url (server), not both.")
     if url:
-        return QdrantClient(url=url, api_key=api_key, prefer_grpc=False)
+        kwargs = {"timeout": timeout} if timeout is not None else {}
+        return QdrantClient(url=url, api_key=api_key, prefer_grpc=False, **kwargs)
     return QdrantClient(path=storage or DEFAULT_STORAGE)
 
 

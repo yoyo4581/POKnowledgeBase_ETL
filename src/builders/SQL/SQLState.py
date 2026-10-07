@@ -5,7 +5,7 @@ from typing import Literal, Optional, Iterator
 import pyodbc
 
 from functools import wraps
-from src.builders.SQL.schema import table_schemas, resolve_clear_order, AnnotationTables
+from src.builders.SQL.schema import table_schemas, resolve_clear_order, AnnotationTables, pathway_source
 from src.builders.SQL.schema.types import TableSchema, IdentityHashSync, DiffSync, DefaultSync
 from src.builders.SQL.schema import table_managers, TableManager
 from src.models.kegg import EntityType
@@ -319,21 +319,65 @@ class SQL_State:
     def fetch_diff_gene_uniprot_ids(self) -> Iterator[list[dict]]:
         """
         uniprot_ids for gene entities that changed this run (diff.entities),
-        joined straight through dbo.entities and dbo.EntrezUniprotMap in one
-        query -- same shape as load_from_diff, streamed via _batch_receive's
-        fetchmany instead of collecting a diff batch's entity_ids in Python
-        and re-querying per batch with a parameterized IN-list (which risks
-        exceeding SQL Server's ~2100 parameter limit once a diff batch holds
-        more than a couple thousand genes).
+        in one query -- same shape as load_from_diff, streamed via
+        _batch_receive's fetchmany instead of collecting a diff batch's
+        entity_ids in Python and re-querying per batch with a parameterized
+        IN-list (which risks exceeding SQL Server's ~2100 parameter limit
+        once a diff batch holds more than a couple thousand genes).
+
+        What a gene's entity_id *is* depends on the source. KEGG keys genes
+        on an Entrez id, so reaching UniProt needs the EntrezUniprotMap
+        crosswalk. Reactome keys them on the accession itself, so the
+        crosswalk is not a join here at all -- it runs the other way, as the
+        entrez qualifier pushed onto an accession-keyed Gene node.
+
+        `pathway_source` is the test, NOT presence of EntrezUniprotMap in
+        the schema. The table is shared by both sources now, so its presence
+        says nothing about which direction applies; testing for it would
+        silently join accessions to CAST(entrez_id AS VARCHAR), match zero
+        rows, and leave FunctionData permanently un-refreshed.
+
+        DISTINCT because diff.entities accumulates until the next
+        ensure_staging_environment, and one entity can appear as both an
+        INSERT and a later UPDATE.
         """
+        crosswalked = pathway_source == "kegg"
+        if crosswalked:
+            select, join, source = (
+                "m.uniprot_id",
+                "INNER JOIN dbo.EntrezUniprotMap AS m "
+                "ON e.entity_id = CAST(m.entrez_id AS VARCHAR(50))",
+                "EntrezUniprotMap")
+        else:
+            select, join, source = "e.entity_id AS uniprot_id", "", "entities"
+
         fetch_query = f"""
-        SELECT m.uniprot_id
+        SELECT DISTINCT {select}
         FROM diff.entities AS d
         INNER JOIN dbo.entities AS e ON d.entity_id = e.entity_id
-        INNER JOIN dbo.EntrezUniprotMap AS m ON e.entity_id = CAST(m.entrez_id AS VARCHAR(50))
+        {join}
         WHERE e.entity_type = '{EntityType.GENE.value}'
         """
-        yield from self._batch_receive(fetch_query, "EntrezUniprotMap")
+        yield from self._batch_receive(fetch_query, source)
+
+    def row_count(self, table_name: str, kind: Literal['dbo', 'staging', 'diff'] = 'dbo') -> int:
+        """
+        Rows in <kind>.<table_name>, or 0 if the table does not exist.
+
+        "Absent" and "empty" collapse to 0 deliberately: every caller so far
+        wants to know whether there is anything to read, and a table that was
+        never provisioned in this database answers that identically to one
+        that was provisioned and left empty.
+        """
+        self._assert_ready()
+        with self.conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", kind, table_name)
+            if not cursor.fetchone()[0]:
+                return 0
+            cursor.execute(f"SELECT COUNT(*) FROM {kind}.{table_name}")
+            return cursor.fetchone()[0]
 
     def missing_tables_check(self, kind: Literal['dbo', 'staging', 'diff']) -> list[str]:
         self._assert_ready()

@@ -21,8 +21,9 @@ Identity: every tool speaks UniProt accessions ("P04637"). Point ids are
 uuid5 of the accession, because Qdrant takes only integers and UUIDs, but that
 hash never surfaces here -- an agent that receives a result can feed its
 uniprot_id straight back into the next tool. `entrez_id` rides along on record
-results when the store was built with a mapping; note it is not unique, since
-several isoforms of one gene are several records.
+results when the store was built with a mapping, as a list of ids; note it is
+not unique, since several isoforms of one gene are several records, and that
+about 5% of accessions have no entrez id and omit the field.
 
 Run it
 ------

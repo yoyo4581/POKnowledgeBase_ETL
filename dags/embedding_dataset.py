@@ -106,7 +106,8 @@ def embedding_dataset_export():
        function text from SQL, run build_dataset(), export_dataset() to
        data/qdrant/go_contrastive/.
     2. Write entrez_to_uniprots.json alongside it -- export_dataset() does not,
-       and store.py's --entrez-map is the key back to Neo4j at gene granularity.
+       and store.py's --entrez-map is what puts an entrez qualifier on each
+       Qdrant record, so a caller holding either id form can reach it.
     3. Tar it and attach it to a release, unless the content hash says nothing
        changed since the last publish.
     """
@@ -122,8 +123,8 @@ def embedding_dataset_export():
         out of the scheduler the moment a credential goes missing, instead of
         failing one task run.
         """
-        from EmbeddingModel.BioBERT_Files.dataset import (Config, _load_protein_data,
-                                                          build_dataset, extract)
+        from EmbeddingModel.BioBERT_Files.dataset import (Config, build_dataset,
+                                                          extract, load_entrez_crosswalk)
         from EmbeddingModel.BioBERT_Files.train import export_dataset
         from src.builders.Neo4j.Neo4jCaller import Neo4j_ETL
         from src.builders.SQL.SQLCaller import SQL_ETL
@@ -135,15 +136,32 @@ def embedding_dataset_export():
         data = build_dataset(**raw, cfg=Config())
         logger.info("build_dataset stats: %s", data.stats)
 
+        # A dataset with no triplets or no held-out queries is not a dataset.
+        # export_dataset() will happily write 0-byte files, this task would
+        # still succeed, and EMBEDDING_DATASET_READY would still fire -- which
+        # is exactly how an empty export once got published and only surfaced
+        # two runs later as an embedding_drift_check failure. The usual cause
+        # is dbo.FunctionData being empty: function_data_build must run first.
+        if not data.rows or not data.eval_queries:
+            raise RuntimeError(
+                f"Refusing to publish an empty dataset: {len(raw['genes'])} corpus texts, "
+                f"{len(raw['annotations'])} annotations, {len(data.rows)} triplets, "
+                f"{len(data.eval_queries)} held-out queries. "
+                "An empty dbo.FunctionData is the usual cause -- run function_data_build.")
+
         out_dir = export_dataset(data, DATASET_DIR)
 
-        # extract() consumes _load_protein_data()'s crosswalk internally and
-        # doesn't hand it back, so query it again rather than change extract()'s
-        # signature. It is ~6k rows; the second read costs nothing measurable.
-        entrez_to_uniprots, _ = _load_protein_data(sql_caller)
+        # The entrez crosswalk, NOT the Gene.id map extract() uses internally.
+        # Under Reactome those are different maps: Gene.id is already the
+        # accession, so extract()'s map is the identity, and writing that out
+        # would stamp entrez_id = "P04637" onto every Qdrant record. Scoped to
+        # the exported corpus so the file carries no dead entries.
+        entrez_to_uniprots = load_entrez_crosswalk(sql_caller, corpus=data.eval_corpus)
+        covered = {u for us in entrez_to_uniprots.values() for u in us}
         (out_dir / "entrez_to_uniprots.json").write_text(
             json.dumps(entrez_to_uniprots, indent=2), encoding="utf-8")
-        logger.info("Wrote entrez_to_uniprots.json (%d genes)", len(entrez_to_uniprots))
+        logger.info("Wrote entrez_to_uniprots.json (%d entrez ids covering %d/%d corpus accessions)",
+                    len(entrez_to_uniprots), len(covered), len(data.eval_corpus))
 
         digest = fingerprint(out_dir)
         logger.info("Dataset fingerprint %s (%d triplets, %d held-out terms, %d corpus texts)",

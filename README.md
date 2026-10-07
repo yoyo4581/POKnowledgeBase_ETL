@@ -18,10 +18,65 @@ do I tell what changed since last time, and prove it."**
 
 ---
 
+## Run Current Database Builds
+
+
+```bash
+curl -sLO https://raw.githubusercontent.com/yoyo4581/POKnowledgeBase_ETL/main/compose.serve.yaml
+docker compose -f compose.serve.yaml up -d
+```
+
+First start pulls ~440 MB of snapshots and restores them; it takes a few
+minutes. After that:
+
+| | |
+|---|---|
+| Qdrant | <http://localhost:6333> — REST, and `/dashboard` in a browser |
+| Neo4j Browser | <http://localhost:7474> — no login |
+| Neo4j Bolt | `bolt://localhost:7687` |
+
+What you get: **122,347 nodes / 602,142 relationships** in the graph, and
+**10,204 protein records / 42,714 chunks** in the vector store.
+
+<details>
+<summary>What it is doing</summary>
+
+Five services, three of which exit once their job is done:
+
+| service | role |
+|---|---|
+| `fetch` | downloads the release assets, verifies `SHA256SUMS` |
+| `qdrant` / `neo4j` | the databases |
+| `qdrant-load` | uploads both snapshots, skipping collections already present |
+| `neo4j-load` | restores the dump **before** the server starts — `neo4j-admin` needs the store to itself, and Community has no online restore |
+
+Ordering is `depends_on: { condition: service_completed_successfully }`, so
+`up` blocks until the data is in.
+
+Everything is idempotent: a second `up` prints `have SHA256SUMS`, `already
+present`, `graph already loaded` and finishes in seconds. Both ports bind to
+`127.0.0.1` only, which is the reason Neo4j ships with `NEO4J_AUTH: none` —
+nothing off the machine can reach it. Override `QDRANT_REST_PORT`,
+`NEO4J_HTTP_PORT` or `NEO4J_BOLT_PORT` if something already owns them.
+
+</details>
+
+> [!TIP]
+> `docker compose -f compose.serve.yaml down` stops everything and keeps the
+> data. Only `down -v` discards it — which is also how you upgrade to a newer
+> release.
+
+This is the serving path. To **rebuild** the knowledge base from Reactome, GO
+and UniProt, you need the repo, Airflow and SQL Server — see
+[Quickstart](#quickstart).
+
+---
+
 ## Contents
 
+- [Run it](#run-it) — serving stack, one command
 - [Overview](#overview)
-- [Quickstart](#quickstart)
+- [Quickstart](#quickstart) — building it yourself
 - [Exploring the data](#exploring-the-data)
 - [Architecture](#architecture)
 - [BioBERT fine-tuning](#biobert-fine-tuning)
@@ -122,9 +177,14 @@ Live figures from the build of **2026-10-01**, `pathway_source=reactome`:
 
 ## Quickstart
 
-The serving layer — Neo4j and Qdrant — runs from `docker-compose.yml`. The ETL
-itself does **not**: Airflow and SQL Server run on the host (see
-[Running the ETL](#running-the-etl)).
+This is the **build** path — the one that regenerates the knowledge base from
+source. If you only want to query it, use [Run it](#run-it) instead: one file,
+one command, no clone.
+
+`docker-compose.yml` is not the same file as `compose.serve.yaml`. This one
+builds databases and produces snapshots, so it bind-mounts repo directories
+and carries the dump/load one-shots. The ETL itself does **not** run in
+Docker: Airflow and SQL Server run on the host.
 
 ### Prerequisites
 
@@ -134,17 +194,32 @@ itself does **not**: Airflow and SQL Server run on the host (see
 | Disk | ~1 GB for the graph volume, ~100 MB for Qdrant storage |
 | Memory | Neo4j is configured for **2 GB heap + 1 GB pagecache**, so give Docker ≥ 4 GB |
 
-### 1. Set the Neo4j password before first start
+### 1. Configure
 
 ```bash
-echo 'NEO4J_CONTAINER_PASSWORD=<choose-one>' >> .env
+cp .env.example .env
 ```
+
+Both containers ship with **no Neo4j password** (`NEO4J_AUTH: none`), which is
+safe only because every port binds to `127.0.0.1`. Leave it alone unless you
+widen the ports — and if you do, set it *before* the first start.
 
 > [!IMPORTANT]
 > `NEO4J_AUTH` is read **only when the data volume is empty**. After the first
-> start the password is whatever it was then — including after loading a dump,
-> because a dump covers the `neo4j` database and not `system`. Set it now, not
-> later. The compose default is literally `changeme-before-first-start`.
+> start, auth is whatever it was then — including after loading a dump, since a
+> dump covers the `neo4j` database and not `system`. Changing it later takes
+> `neo4j-admin dbms set-initial-password` or `down -v`.
+
+Override the ports in `.env` if something already owns them. A local Neo4j
+Desktop install holds **7474 and 7687**, and a second Desktop instance takes
+7688 — in which case pick free ones and point `NEO4J_CONTAINER_URI` at the
+same place:
+
+```bash
+NEO4J_HTTP_PORT="7475"
+NEO4J_BOLT_PORT="7689"
+NEO4J_CONTAINER_URI="bolt://localhost:7689"
+```
 
 ### 2. Start the services
 
@@ -158,6 +233,10 @@ curl -s localhost:7474 >/dev/null && echo "neo4j up"
 |---|---|---|---|
 | `qdrant` | `qdrant/qdrant:v1.19.1` | `6333` REST, `6334` gRPC | `qdrant_storage:/qdrant/storage` |
 | `neo4j` | `neo4j:5.19.0-community` | `7474` HTTP/Browser, `7687` Bolt | `neo4j_data:/data`, `neo4j_logs:/logs`, `./data/neo4j/dumps:/dumps` |
+
+All ports bind to `127.0.0.1`, not `0.0.0.0` — a bare `"6333:6333"` publishes
+to every interface, which with no API key means an unauthenticated store
+anyone routable can read and write.
 
 Both declare healthchecks (`interval 10s`, `retries 12`); Neo4j allows a 40 s
 start period. Qdrant probes `/readyz` rather than `/healthz` deliberately —
@@ -638,9 +717,17 @@ flowchart TD
 ```
 
 Only `reactome_meta_build` is triggered by hand; the rest fire on Airflow
-assets. The four `kegg_*` DAGs and `entrez_uniprot_annotation` form the legacy
+assets. The four `kegg_*` DAGs plus `go_ontology_annotation` form the legacy
 lineage — still present and runnable via `pathway_source=kegg`, but superseded.
 Pause them in the UI to avoid writing KEGG-shaped rows into a Reactome database.
+
+`entrez_uniprot_annotation` serves both sources and is **not** legacy. It owns
+`dbo.EntrezUniprotMap` and pushes the opposite id form onto each Gene node:
+`uniprot_ids` under KEGG (which keys genes by Entrez id), `entrez_ids` under
+Reactome (which keys them by accession). Under Reactome that id is a lookup
+qualifier rather than a join key, and it rides down to the Qdrant record
+payload so a caller holding either id form can reach the same record. About
+95% of genes carry one; the rest have no Entrez mapping and omit the field.
 
 <details>
 <summary>All 16 DAGs</summary>
@@ -662,7 +749,7 @@ Pause them in the UI to avoid writing KEGG-shaped rows into a Reactome database.
 | `kgml_structure_annotation` *(legacy)* | asset | `kegg://structure_complete` |
 | `kgml_entity_annotation` *(legacy)* | asset | — |
 | `go_ontology_annotation` *(legacy)* | asset | `neo4j://kgml_complete` |
-| `entrez_uniprot_annotation` *(legacy)* | manual | — |
+| `entrez_uniprot_annotation` | manual | — |
 
 </details>
 
@@ -860,8 +947,14 @@ from nDCG@10 0.1716 (epoch 1) to 0.2305 (epoch 10).
 ├── EmbeddingModel/
 │   ├── BioBERT_Files/            train.py, dataset.py
 │   └── biobert-go-retrieval/     fine-tuned encoder
+├── notebooks/                    stack_smoke_test.ipynb + scratch
+├── scripts/                      one-off probes, not part of any DAG
 ├── docs/assets/                  generated figures
-├── docker-compose.yml            qdrant + neo4j (+ load/dump profiles)
+├── data/                         gitignored, but snapshots/ + dumps/ are
+│                                 tracked-empty so Docker does not create
+│                                 them as root
+├── docker-compose.yml            qdrant + neo4j (+ load profiles)
+├── .env.example                  copy to .env
 └── Finetune_BioBERT_Colab.ipynb
 ```
 

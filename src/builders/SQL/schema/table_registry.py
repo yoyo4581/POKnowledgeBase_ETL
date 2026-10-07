@@ -1,6 +1,7 @@
 from src.builders.SQL.schema.definitions import table_schemas
-from src.builders.SQL.schema.types import DefaultSync, TableSchema
-from src.builders.SQL.schema.strategies import (DBSchema, DbOpsStrategy, SQLStageUpsertDiff, SQLStageUpsert, SQLStageUpsertConstraints)
+from src.builders.SQL.schema.types import DefaultSync, SnapshotSync, TableSchema
+from src.builders.SQL.schema.strategies import (DBSchema, DbOpsStrategy, SQLStageUpsertDiff, SQLStageUpsert,
+                                                SQLStageUpsertConstraints, SQLSnapshotReplace)
 
 
 def _select_strategy(schema) -> DbOpsStrategy:
@@ -24,6 +25,11 @@ def _select_strategy(schema) -> DbOpsStrategy:
     adds a column that shouldn't count toward dedup identity.
     """
     
+    if isinstance(schema.sync, SnapshotSync):
+        # Ahead of the constraints check: a snapshot is replaced wholesale,
+        # so there is no MERGE for SQLStageUpsertConstraints to build and
+        # nothing for it to defer.
+        return SQLSnapshotReplace()
     if schema.constraints:
         return SQLStageUpsertConstraints()
     if isinstance(schema.sync, DefaultSync):
@@ -44,7 +50,9 @@ class TableManager:
         return self.strategy.create_table(self.schema, kind=DBSchema.STAGING)
 
     def create_diff_table(self) -> str | None:
-        if isinstance(self.schema.sync, DefaultSync):
+        # SnapshotSync alongside DefaultSync: a replaced table has no
+        # incremental change to record, and nothing reads a diff of one.
+        if isinstance(self.schema.sync, (DefaultSync, SnapshotSync)):
             return None
         return self.strategy.create_table(self.schema, kind=DBSchema.DIFF)
 
@@ -58,7 +66,7 @@ class TableManager:
 
     def wipe_staging_environment(self) -> list[str]:
         statements = [self.strategy.wipe_data(self.schema, kind=DBSchema.STAGING)]
-        if not isinstance(self.schema.sync, DefaultSync):
+        if not isinstance(self.schema.sync, (DefaultSync, SnapshotSync)):
             wipe_diff = self.strategy.wipe_data(self.schema, kind=DBSchema.DIFF)
             statements.append(wipe_diff)
         return statements

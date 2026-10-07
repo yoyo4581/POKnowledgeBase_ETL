@@ -8,7 +8,8 @@ Negative = function text of a gene that is confusable but NOT annotated
 
 Pipeline
   1. extract    read GO structure + annotations from Neo4j, join gene ->
-                function text across SQL (dbo.EntrezUniprotMap, dbo.FunctionData)
+                function text across SQL (dbo.FunctionData, plus
+                dbo.EntrezUniprotMap when the source keys genes by entrez id)
   2. clean      evidence + qualifier filters; separate NOT annotations
   3. propagate  true path rule over is_a/part_of: positives flow UP to
                 ancestors, NOT annotations flow DOWN to descendants
@@ -25,7 +26,7 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Iterator, TYPE_CHECKING
+from typing import Iterable, Iterator, TYPE_CHECKING
 
 # Neo4jCaller validates NEO4J_USERNAME/NEO4J_PASSWORD at import time, and
 # SQLCaller unconditionally imports pyodbc (which needs a system ODBC
@@ -112,23 +113,30 @@ class Config:
 # ---------------------------------------------------------------------------
 def _load_protein_data(sql_caller: SQL_ETL) -> tuple[dict[str, list[str]], list[dict]]:
     """
-    FunctionData is keyed by uniprot_id (protein), but GO annotations in
-    Neo4j are keyed by gene (Gene.id = entrez id) -- this bridges the two
-    through dbo.EntrezUniprotMap, the same crosswalk entrez_uniprot_annotation
-    keeps current.
+    Joins Neo4j's gene granularity to FunctionData's accession granularity.
 
-    A gene with several mapped uniprot_ids (isoforms, paralogous entries)
-    can have genuinely different function text per uniprot_id -- there's no
-    rule that a gene has exactly one. So nothing here picks a single
-    "representative" text: every uniprot_id with function text becomes its
-    own corpus entry, and extract() below expands each gene-level
-    annotation onto every uniprot_id under that gene (see entrez_to_uniprots).
+    FunctionData is keyed by uniprot_id (protein). Q_ANNOTATIONS comes back
+    keyed by Gene.id, and what Gene.id *is* depends on the source:
 
-    Returns (entrez_to_uniprots, protein_rows): entrez_to_uniprots feeds
-    that annotation expansion, and protein_rows is
-    [{"gene": uniprot_id, "text": function_text}, ...] -- kept as "gene" to
-    match build_dataset's existing (schema-agnostic) field name, even
-    though the id is a uniprot_id, not an entrez id.
+      kegg      an entrez id, so reaching an accession needs the
+                dbo.EntrezUniprotMap crosswalk. A gene with several mapped
+                accessions (isoforms, paralogous entries) can have genuinely
+                different function text per accession, so nothing here picks
+                a "representative": every accession with function text
+                becomes its own corpus entry and extract() expands the
+                gene's annotations onto all of them.
+
+      reactome  the accession itself, so the mapping is the identity and
+                the only work left is to drop genes with no function text.
+
+    Returns (gene_to_accessions, protein_rows). gene_to_accessions feeds
+    extract()'s annotation expansion and is keyed by *Gene.id*, whatever
+    that is for the active source -- it is NOT an entrez crosswalk under
+    Reactome, and must not be confused with load_entrez_crosswalk() below,
+    which is keyed by entrez id and exists for an unrelated purpose.
+    protein_rows is [{"gene": uniprot_id, "text": function_text}, ...] --
+    kept as "gene" to match build_dataset's existing (schema-agnostic)
+    field name, even though the id is a uniprot_id.
     """
     uniprot_text: dict[str, str] = {}
     try:
@@ -138,17 +146,61 @@ def _load_protein_data(sql_caller: SQL_ETL) -> tuple[dict[str, list[str]], list[
     except ValueError:
         return {}, []
 
-    entrez_to_uniprots: dict[str, list[str]] = defaultdict(list)
+    # pathway_source, not "is EntrezUniprotMap in the schema" -- the table is
+    # shared by both sources now, so its presence says nothing about whether
+    # Gene.id needs crosswalking. Testing for it here would look up accessions
+    # in an entrez-keyed dict, miss every time, and drop 100% of annotations.
+    from src.builders.SQL.schema import pathway_source
+
+    gene_to_accessions: dict[str, list[str]] = defaultdict(list)
+    if pathway_source == "kegg":
+        try:
+            for batch in sql_caller.sql_state.fetch_data(table_name="EntrezUniprotMap", kind="dbo"):
+                for row in batch:
+                    if row["uniprot_id"] in uniprot_text:
+                        gene_to_accessions[str(row["entrez_id"])].append(row["uniprot_id"])
+        except ValueError:
+            return {}, []
+    else:
+        for uniprot_id in uniprot_text:
+            gene_to_accessions[uniprot_id].append(uniprot_id)
+
+    protein_rows = [{"gene": uniprot_id, "text": text} for uniprot_id, text in uniprot_text.items()]
+    return dict(gene_to_accessions), protein_rows
+
+
+def load_entrez_crosswalk(sql_caller: SQL_ETL,
+                          corpus: Iterable[str] | None = None) -> dict[str, list[str]]:
+    """
+    {entrez_id: [uniprot_id, ...]} straight from dbo.EntrezUniprotMap,
+    optionally restricted to `corpus` (the accessions that actually have
+    function text, so the exported file carries no dead entries).
+
+    Deliberately separate from _load_protein_data(). Under KEGG the two
+    happen to coincide; under Reactome they are different maps for
+    different jobs, and conflating them is a silent failure in both
+    directions:
+
+      _load_protein_data   keyed by Gene.id, joins Neo4j annotations to
+                           corpus text. Identity under Reactome.
+      load_entrez_crosswalk  keyed by entrez id, rides down to the Qdrant
+                           record payload as a lookup qualifier so a caller
+                           holding an entrez id can still find the record.
+
+    ~95% of this corpus has an entrez id; the rest legitimately has none and
+    simply does not appear here. Returns {} if the table is absent.
+    """
+    keep = set(corpus) if corpus is not None else None
+    crosswalk: dict[str, list[str]] = defaultdict(list)
     try:
         for batch in sql_caller.sql_state.fetch_data(table_name="EntrezUniprotMap", kind="dbo"):
             for row in batch:
-                if row["uniprot_id"] in uniprot_text:
-                    entrez_to_uniprots[str(row["entrez_id"])].append(row["uniprot_id"])
+                uid = row["uniprot_id"]
+                if keep is None or uid in keep:
+                    crosswalk[str(row["entrez_id"])].append(uid)
     except ValueError:
-        return {}, []
-
-    protein_rows = [{"gene": uniprot_id, "text": text} for uniprot_id, text in uniprot_text.items()]
-    return dict(entrez_to_uniprots), protein_rows
+        return {}
+    return {e: sorted(set(us)) for e, us in crosswalk.items()}
 
 
 def extract(neo4j_caller: Neo4j_ETL, sql_caller: SQL_ETL, database: str | None = None) -> dict:
@@ -158,18 +210,20 @@ def extract(neo4j_caller: Neo4j_ETL, sql_caller: SQL_ETL, database: str | None =
         records, _, _ = neo4j_caller.driver.execute_query(q, database_=database, routing_=RoutingControl.READ)
         return [r.data() for r in records]
 
-    entrez_to_uniprots, protein_rows = _load_protein_data(sql_caller)
+    gene_to_accessions, protein_rows = _load_protein_data(sql_caller)
 
-    # Q_ANNOTATIONS comes back keyed by Gene.id (entrez id), since that's
-    # the only granularity GO annotations exist at in Neo4j. Expand each
-    # annotation onto every uniprot_id under that gene, so annotations line
-    # up with protein_rows's per-uniprot_id corpus instead of a gene with
-    # 3 isoforms only ever matching 1 of them.
+    # Q_ANNOTATIONS comes back keyed by Gene.id -- an entrez id under KEGG,
+    # an accession under Reactome. Expand each annotation onto every corpus
+    # accession under that gene, so annotations line up with protein_rows's
+    # per-accession corpus instead of a gene with 3 isoforms only ever
+    # matching 1 of them. Where the mapping is the identity (Reactome) this
+    # expansion is a 1:1 pass that drops genes with no function text, which
+    # is exactly the scoping wanted.
     gene_annotations = run(Q_ANNOTATIONS)
     annotations = [
         {"gene": uniprot_id, "term": a["term"], "qualifier": a["qualifier"], "evidence": a["evidence"]}
         for a in gene_annotations
-        for uniprot_id in entrez_to_uniprots.get(a["gene"], ())
+        for uniprot_id in gene_to_accessions.get(a["gene"], ())
     ]
 
     return {
@@ -297,8 +351,8 @@ def build_dataset(annotations, hierarchy, terms, genes, cfg: Config = Config()) 
 
     # Why the size filter rejected what it rejected. A third of the genes
     # carrying keep_evidence annotations have no function text at all (they
-    # never reach extract()'s annotation expansion, since entrez_to_uniprots
-    # only holds entrez ids with at least one uniprot_id in FunctionData), so
+    # never reach extract()'s annotation expansion, since gene_to_accessions
+    # only holds genes with at least one accession in FunctionData), so
     # len(pos[t]) runs at roughly two thirds of a term's true annotation count.
     # A specific term can therefore be pushed under min_pos by that gap rather
     # than by genuine sparsity, and a term genuinely over max_pos can slip

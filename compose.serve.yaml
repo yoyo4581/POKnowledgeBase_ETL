@@ -1,0 +1,131 @@
+# Standalone serving stack. This file is the ONLY thing you need -- no clone,
+# no setup script, no manual downloads.
+#
+#     curl -sLO https://raw.githubusercontent.com/yoyo4581/POKnowledgeBase_ETL/main/compose.serve.yaml
+#     docker compose -f compose.serve.yaml up -d
+#
+# The first `up` pulls ~440MB of data from the latest GitHub release and loads
+# it; later ones start in seconds because the named volumes persist. Then:
+#
+#     Qdrant   http://localhost:6333         (REST; /dashboard in a browser)
+#     Neo4j    bolt://localhost:7687         (no auth -- see below)
+#     Browser  http://localhost:7474
+#
+# To refresh to a newer release:  docker compose -f compose.serve.yaml down -v
+# and up again. `down` alone keeps the data; only -v discards it.
+#
+# NOT the file the ETL uses. docker-compose.yml in the repo root builds these
+# databases from source and needs a checkout; this one only consumes what that
+# published.
+
+name: pokb
+
+services:
+
+  # --- fetch: pull the release assets into a shared volume -----------------
+  #
+  # /releases/latest/download/<name> is a permanent URL to the newest release,
+  # which is why publish_snapshots uploads under stable, unversioned names.
+  # Pinning a tag here instead would freeze consumers on one build.
+  #
+  # Idempotent by file existence, so a re-run costs one HEAD-less `test -s`
+  # rather than 440MB. The volume is what makes it skippable: it outlives the
+  # container, and only `down -v` clears it.
+  fetch:
+    image: curlimages/curl:8.11.1
+    # root, because this WRITES to the seed volume. Docker creates a named
+    # volume root-owned, and only seeds its ownership from the image when the
+    # image has content at that path -- /data gets 7474 from the neo4j image
+    # that way, /seed gets nothing, so it stays root:root 755 and the image's
+    # own uid 100 cannot write. Downloads land 644, which the two loaders
+    # (uid 100 and 7474) read without trouble.
+    user: "0:0"
+    volumes:
+      - seed:/seed
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'set -e; B=https://github.com/yoyo4581/POKnowledgeBase_ETL/releases/latest/download; for f in function_records.snapshot function_chunks.snapshot neo4j.dump SHA256SUMS; do if [ -s "/seed/$$f" ]; then echo "have $$f"; else echo "fetching $$f"; curl -fsSL --retry 3 --retry-delay 5 -o "/seed/$$f.part" "$$B/$$f"; mv "/seed/$$f.part" "/seed/$$f"; fi; done; cd /seed && sha256sum -c SHA256SUMS && echo "checksums OK"'
+
+  # --- qdrant --------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${QDRANT_REST_PORT:-6333}:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      QDRANT__LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  # Restores both collections, unless they are already there. Uploaded as
+  # multipart rather than recovered from a file:// path: Qdrant refuses a
+  # file:// location outside its own snapshots directory, which would force a
+  # writable mount on the server for no benefit.
+  qdrant-load:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      fetch: { condition: service_completed_successfully }
+      qdrant: { condition: service_healthy }
+    volumes:
+      - seed:/seed:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'set -e; for c in function_records function_chunks; do if curl -fsS -o /dev/null "http://qdrant:6333/collections/$$c" 2>/dev/null; then echo "$$c already present"; else echo "restoring $$c"; curl -fsS -X POST "http://qdrant:6333/collections/$$c/snapshots/upload?priority=snapshot" -F "snapshot=@/seed/$$c.snapshot" > /dev/null; echo "  done"; fi; done'
+
+  # --- neo4j ---------------------------------------------------------------
+  #
+  # The load runs BEFORE the server, not after: neo4j-admin needs the store to
+  # itself. Community has no online restore, so this ordering is forced.
+  #
+  # user 7474 because the entrypoint would normally drop to it anyway, and
+  # running the load as root would leave /data root-owned and unwritable by
+  # the server that follows. A fresh named volume inherits 7474 from the
+  # image, so this works on first boot.
+  neo4j-load:
+    image: neo4j:5.19.0-community
+    user: "7474:7474"
+    depends_on:
+      fetch: { condition: service_completed_successfully }
+    volumes:
+      - neo4j_data:/data
+      - seed:/seed:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'if [ -d /data/databases/neo4j ]; then echo "graph already loaded"; else echo "loading neo4j.dump"; neo4j-admin database load neo4j --from-path=/seed --overwrite-destination=true; fi'
+
+  neo4j:
+    image: neo4j:5.19.0-community
+    restart: unless-stopped
+    depends_on:
+      neo4j-load: { condition: service_completed_successfully }
+    ports:
+      - "127.0.0.1:${NEO4J_HTTP_PORT:-7474}:7474"
+      - "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j_data:/data
+    environment:
+      # No password. Safe only because the ports above are bound to 127.0.0.1,
+      # so nothing off this machine can reach Bolt or the Browser. If you
+      # publish them more widely, set neo4j/<password> here BEFORE the first
+      # start -- it is ignored once /data holds a system database.
+      NEO4J_AUTH: none
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache_size: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+volumes:
+  seed:            # downloaded release assets; safe to discard after loading
+  qdrant_storage:
+  neo4j_data:

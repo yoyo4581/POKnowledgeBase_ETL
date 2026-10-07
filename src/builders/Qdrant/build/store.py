@@ -110,27 +110,38 @@ def load_corpus(path: str | Path) -> dict[str, str]:
     return {u: t for u, t in corpus.items() if isinstance(t, str) and t.strip()}
 
 
-def load_entrez_map(path: str | Path) -> dict[str, str]:
+def load_entrez_map(path: str | Path) -> dict[str, list[str]]:
     """
-    Optional {uniprot_id: entrez_id} enrichment.
+    Optional {uniprot_id: [entrez_id, ...]} enrichment.
 
     Accepts either direction, because the ETL side has it as
     entrez_to_uniprots ({entrez_id: [uniprot_id, ...]}) -- that is the shape
-    _load_protein_data() builds -- while the payload wants the inverse. A
+    load_entrez_crosswalk() builds -- while the payload wants the inverse. A
     list-valued file is treated as the entrez->accessions direction and
     inverted; a string-valued one is taken as already accession-keyed.
 
-    Not required. eval_corpus.json carries no entrez ids (export_dataset()
-    never writes entrez_to_uniprots), so a store can be built today without
-    this and enriched on a later rebuild. What it buys is the join back to
-    Neo4j, where annotations live at entrez granularity.
+    The inverse is list-valued, not scalar: an accession can carry more than
+    one entrez id (46 of them do in the current corpus). Collapsing to one
+    would silently make the record unreachable by whichever id lost, which
+    defeats the only reason the field exists.
+
+    Not required. eval_corpus.json carries no entrez ids, so a store can be
+    built without this and enriched on a later rebuild. What it buys is the
+    second id form: a caller holding an entrez id can still find the record,
+    and it is the join back to Neo4j Gene nodes.
     """
     raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not raw:
         return {}
+    out: dict[str, list[str]] = {}
     if isinstance(next(iter(raw.values())), list):
-        return {u: str(e) for e, us in raw.items() for u in us}
-    return {u: str(e) for u, e in raw.items()}
+        for e, us in raw.items():
+            for u in us:
+                out.setdefault(u, []).append(str(e))
+    else:
+        for u, e in raw.items():
+            out.setdefault(u, []).append(str(e))
+    return {u: sorted(set(es)) for u, es in out.items()}
 
 
 def merge_corpora(sources: list[tuple[str, dict[str, str]]], limit: int | None = None
@@ -172,7 +183,7 @@ def merge_corpora(sources: list[tuple[str, dict[str, str]]], limit: int | None =
 # --- shaping ------------------------------------------------------------
 
 def shape(corpus: dict[str, str], window: int, stride: int,
-          entrez: dict[str, str] | None = None) -> tuple[list[dict], list[dict]]:
+          entrez: dict[str, list[str]] | None = None) -> tuple[list[dict], list[dict]]:
     """
     corpus -> (record payloads, chunk payloads), in a stable accession order so
     that two builds of the same corpus produce byte-identical exports.
@@ -184,9 +195,11 @@ def shape(corpus: dict[str, str], window: int, stride: int,
 
     entrez_id goes on records only, when a mapping is supplied. Chunks never
     need it: they only ever join to their parent record, and that join is the
-    accession. It is the key back to Neo4j, where annotations live at gene
-    granularity -- and it is deliberately NOT unique per record, since several
-    isoforms of one gene are several records here.
+    accession. It is a lookup qualifier and the key back to Neo4j Gene nodes
+    -- deliberately NOT unique per record, since several isoforms of one gene
+    are several records here, and deliberately a LIST, since one accession can
+    carry several entrez ids. A Qdrant keyword index matches any element of a
+    list, so MatchValue(entrez_id="7157") still finds it.
     """
     entrez = entrez or {}
     records, chunks = [], []
@@ -359,25 +372,26 @@ def cmd_build(args) -> None:
         print(f"  {args.entrez_map}: entrez ids for {len(corpus) - len(unmapped)}/"
               f"{len(corpus)} accessions")
         if unmapped:
-            # Worth stating plainly, because these records behave differently
-            # from the rest and nothing downstream will say so.
+            # What this means depends on how the KB keys genes, and it is worth
+            # being exact, because the two cases are opposites.
             #
-            # dataset.py builds protein_rows from every FunctionData row, but
-            # expands GO annotations only onto accessions found in
-            # EntrezUniprotMap:
+            # When Gene.id IS an entrez id (KEGG), dataset.py expands GO
+            # annotations only onto accessions found in the crosswalk, so an
+            # accession missing from it lands in the corpus with no annotations
+            # at all -- never in eval_relevant, so never a correct answer. It
+            # is still retrievable and still in the random-negative pool: a
+            # structural distractor that lowers absolute metrics without
+            # affecting the between-arm delta.
             #
-            #     annotations = [... for uniprot_id in entrez_to_uniprots.get(a["gene"], ())]
-            #
-            # An accession missing from that map therefore lands in the corpus
-            # with no annotations at all -- never in pos[t], so never in
-            # eval_relevant for any term, so never a correct answer. It can
-            # still be retrieved, and it is still in all_genes, the pool random
-            # training negatives are drawn from.
+            # When Gene.id is the accession (Reactome), the crosswalk does not
+            # gate annotation at all. A missing entrez id costs the record one
+            # alternative lookup key and nothing else -- its GO annotations,
+            # and its eligibility as a correct answer, are untouched.
             print(f"  {len(unmapped)} accession(s) have function text but no entrez id. "
-                  f"They are indexed and searchable, but they carry no GO annotations in "
-                  f"the KB, so they can never be relevant to an eval query -- they are "
-                  f"structural distractors that lower absolute metrics without affecting "
-                  f"the between-arm delta. Absent entrez_id is the marker for them.")
+                  f"They are indexed and searchable either way. If this KB keys genes by "
+                  f"entrez id they also carry no GO annotations and act as structural "
+                  f"distractors; if it keys genes by accession they are fully annotated "
+                  f"and merely lack the alternative lookup key.")
             print(f"  e.g. {', '.join(sorted(unmapped)[:5])}")
     print(f"Corpus: {len(corpus)} UniProt accessions")
 
@@ -405,6 +419,7 @@ def cmd_build(args) -> None:
         "point_id": "uuid5(NAMESPACE_URL, uniprot_id)",
         "entrez_map": str(args.entrez_map) if args.entrez_map else None,
         "n_entrez_ids": sum(1 for r in records if "entrez_id" in r),
+        "n_entrez_multi": sum(1 for r in records if len(r.get("entrez_id", ())) > 1),
         "model": args.model,
         "dim": dim,
         "distance": "Cosine",
@@ -472,7 +487,7 @@ def main() -> None:
                             "proteins. Several sources may be given; earlier ones win.")
     build.add_argument("--entrez-map",
                        help="Optional JSON adding entrez_id to record payloads. Takes either "
-                            "{entrez_id: [uniprot_id, ...]} (the shape _load_protein_data builds) "
+                            "{entrez_id: [uniprot_id, ...]} (the shape load_entrez_crosswalk builds) "
                             "or {uniprot_id: entrez_id}. Not needed to build -- eval_corpus.json "
                             "has no entrez ids -- but it is the join back to Neo4j, where "
                             "annotations live at gene granularity.")

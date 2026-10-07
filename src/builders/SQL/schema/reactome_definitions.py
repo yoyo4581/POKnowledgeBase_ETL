@@ -40,7 +40,6 @@ reactome_table_schemas: dict[str, TableSchema] = {
             "display_name": "NVARCHAR(512) NOT NULL",
             "compartment": "VARCHAR(100) NULL",
         },
-        sync=DiffSync(diff_columns=("display_name", "compartment")),
         __table_name__="EntityData",
     ),
 
@@ -66,8 +65,8 @@ reactome_table_schemas: dict[str, TableSchema] = {
     ),
     "entity_identity": TableSchema(
         columns={
-            "entity_id": "VARCHAR(20)",
-            "reference_id": "VARCHAR(20)",
+            "entity_id": "VARCHAR(40)",
+            "reference_id": "VARCHAR(40)",
             "reference_type": "VARCHAR(30)",
         },
         sync=IdentityHashSync(
@@ -78,8 +77,8 @@ reactome_table_schemas: dict[str, TableSchema] = {
     ),
     "entity_moiety": TableSchema(
         columns={
-            "entity_id": "VARCHAR(20)",
-            "moiety_id": "VARCHAR(20)",
+            "entity_id": "VARCHAR(40)",
+            "moiety_id": "VARCHAR(40)",
             "psi_mod": "VARCHAR(20) NULL",
         },
         sync=IdentityHashSync(
@@ -99,29 +98,25 @@ reactome_table_schemas: dict[str, TableSchema] = {
             "gene_synonym": "NVARCHAR(512) NULL",
             "ensembl_gene": "VARCHAR(30) NULL",
         },
-        sync=DiffSync(diff_columns=("gene_name", "full_name", "gene_synonym",
-                                    "ensembl_gene")),
         __table_name__="GeneData",
     ),
     "CompoundData": TableSchema(
         key="compound_id",
         columns={
-            "compound_id": "VARCHAR(20)",
+            "compound_id": "VARCHAR(40)",
             "compound_name": "NVARCHAR(MAX)",
             "formula": "VARCHAR(255) NULL",
             "compound_synonyms": "NVARCHAR(MAX) NULL",
         },
-        sync=DiffSync(diff_columns=("compound_name", "formula")),
         __table_name__="CompoundData",
     ),
     "DrugData": TableSchema(
         key="drug_id",
         columns={
-            "drug_id": "VARCHAR(20)",
+            "drug_id": "VARCHAR(40)",
             "drug_name": "NVARCHAR(MAX)",
             "drug_type": "VARCHAR(30)",
         },
-        sync=DiffSync(diff_columns=("drug_name", "drug_type")),
         __table_name__="DrugData",
     ),
     "reactions": TableSchema(
@@ -133,7 +128,6 @@ reactome_table_schemas: dict[str, TableSchema] = {
             "reaction_type": "VARCHAR(30)",
             "pathway_id": "VARCHAR(20)",
         },
-        sync=DiffSync(diff_columns=("name", "compartment", "reaction_type")),
         __table_name__="reactions",
     ),
     "PathwayData": TableSchema(
@@ -142,7 +136,6 @@ reactome_table_schemas: dict[str, TableSchema] = {
             "pathway_id": "VARCHAR(20)",
             "description": "NVARCHAR(MAX)",
         },
-        sync=DiffSync(diff_columns=("description",)),
         constraints=(
             ForeignKey(
                 name="fk_pathway_id",
@@ -209,8 +202,8 @@ reactome_table_schemas: dict[str, TableSchema] = {
     # coverage-scoped sync does that.
     "gene_edges": TableSchema(
         columns={
-            "source_id": "VARCHAR(20)",
-            "target_id": "VARCHAR(20)",
+            "source_id": "VARCHAR(40)",
+            "target_id": "VARCHAR(40)",
             "source_label": "VARCHAR(20)",
             "target_label": "VARCHAR(20)",
             "rel_type": "VARCHAR(30)",

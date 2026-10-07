@@ -1,6 +1,6 @@
 import logging
 from src.builders.SQL.SQLCaller import SQL_ETL
-from typing import Iterable, Iterator, TypeVar, Sequence
+from typing import Callable, Iterable, Iterator, TypeVar, Sequence
 from itertools import islice
 from src.models.kegg import *
 from src.models.go import GOOntologyMeta, GOOntologyRecord, EntrezUniprotMap
@@ -18,7 +18,6 @@ def batched(iterable: Iterable[T], n: int) -> Iterator[list[T]]:
     while chunk := list(islice(it, n)):
         yield chunk
 
-from typing import Callable, Sequence
 
 def _stage_and_upsert(
     records: Iterable[T],
@@ -33,6 +32,14 @@ def _stage_and_upsert(
 
     Each batch is staged, upserted, and wiped before moving to the next --
     staging never accumulates more than one batch's worth of rows at a time.
+
+    NOT suitable for a table whose sync has coverage_scope_columns unless a
+    record carries every row for each scope value it touches -- batches are
+    drawn by record count, so a scope value split across two batches has the
+    second batch's coverage-scoped DELETE retract what the first wrote. The
+    pathway-scoped tables satisfy this because one record is one pathway.
+    For a source that is authoritative for the whole table, use SnapshotSync
+    and _stage_all_then_replace instead.
     """
     totals = {table: 0 for table in extractors}
     buffers = {table: [] for table in extractors}
@@ -60,8 +67,72 @@ def consume_pathway_ids(data: Iterator[PathwayIds], sql_caller: SQL_ETL) -> dict
     return _stage_and_upsert(data, sql_caller, {PathwayIds.__table_name__: lambda r: [r]})
 
 
+def _stage_all_then_replace(
+    records: Iterable[BaseSQLObject],
+    sql_caller: SQL_ETL,
+    table: str,
+    batch_size: int = 5000,
+) -> dict:
+    """
+    Load path for a SnapshotSync table: stage every row, then replace dbo
+    with staging in one atomic swap.
+
+    The ordering is the whole point. _stage_and_upsert upserts per batch,
+    which for a replace would mean each batch deleting the previous one's
+    rows. Here batching governs only how rows reach staging -- staging
+    carries no delete semantics -- so the result is identical at any batch
+    size, and the single swap at the end is what touches dbo.
+
+    Staging is wiped first, not just last: a previous run that died between
+    staging and the swap would otherwise leave rows behind and merge a stale
+    snapshot into this one. ensure_staging_ready comes before that wipe
+    because stage_data is normally what provisions the staging table, and on
+    a database that has never run this table the wipe would otherwise hit a
+    table that does not exist yet.
+    """
+    sql_caller.sql_state.ensure_staging_ready(table)
+    sql_caller.wipe_staging(target_table=table)
+
+    staged = 0
+    for batch in batched(records, batch_size):
+        if not batch:
+            continue
+        sql_caller.stage_data(target_table=table, data=batch)
+        staged += len(batch)
+
+    if not staged:
+        raise ValueError(
+            f"{table}: refusing to replace a snapshot table with zero rows -- "
+            f"that would empty dbo.{table}.")
+
+    sql_caller.upsert_data(target_table=table)
+
+    # Count dbo, not what was staged. A staged-row count is the size of the
+    # input, not the result: it reads 39878 whether the swap landed, deleted
+    # half the rows on a MERGE, or threw an exception that SQL_ETL.sql_safe
+    # swallowed into a log line. That is exactly how EntrezUniprotMap sat at
+    # 21821 rows while every Airflow run reported 39878.
+    actual = sql_caller.sql_state.row_count(table)
+    if actual != staged:
+        raise ValueError(
+            f"{table}: staged {staged} rows but dbo holds {actual} after the swap. "
+            f"The replace did not land -- check the log above for a swallowed "
+            f"SQL error.")
+
+    sql_caller.wipe_staging(target_table=table)
+    return {f"{table}_rows": actual}
+
+
 def consume_entrez_uniprot_map(data: Iterator[EntrezUniprotMap], sql_caller: SQL_ETL, batch_size: int = 5000) -> dict:
-    return _stage_and_upsert(data, sql_caller, {EntrezUniprotMap.__table_name__: lambda r: [r]}, batch_size)
+    """
+    Replaces dbo.EntrezUniprotMap with the snapshot in `data`.
+
+    The map comes straight from UniProt's idmapping file, which is always the
+    complete mapping -- so there is nothing to reconcile and the old contents
+    are simply superseded. Reconciling it was how 45% of the pairs went
+    missing; see SnapshotSync.
+    """
+    return _stage_all_then_replace(data, sql_caller, EntrezUniprotMap.__table_name__, batch_size)
 
 
 def consume_function_data(data: Iterator[FunctionData], sql_caller: SQL_ETL, batch_size: int = 500) -> dict:
@@ -74,6 +145,16 @@ def consume_gene_uniprot_annotations(batches: Iterator[list[dict]], neo4j_caller
         result = neo4j_caller.annotate_gene_uniprot_ids(batch)
         total += result.get("gene_uniprot_ids_annotated", 0)
     return {"gene_uniprot_ids_annotated": total}
+
+
+def consume_gene_entrez_annotations(batches: Iterator[list[dict]], neo4j_caller: Neo4j_ETL) -> dict:
+    total = 0
+    offered = 0
+    for batch in batches:
+        result = neo4j_caller.annotate_gene_entrez_ids(batch)
+        total += result.get("gene_entrez_ids_annotated", 0)
+        offered += result.get("rows_offered", 0)
+    return {"gene_entrez_ids_annotated": total, "rows_offered": offered}
 
 
 def consume_kgml_meta_data(

@@ -1,6 +1,7 @@
 from src.parsers.KEGG.KEGGCaller import KEGG_ETL, KEGGBlockedError
 from src.parsers.GO.GOCaller import GO_ETL
-from src.parsers.UniProt.UniProtCaller import UniProt_ETL, clean_function_text
+from src.parsers.UniProt.UniProtCaller import (UniProt_ETL, clean_function_text,
+                                               LOCAL_PATH as LOCAL_IDMAPPING_PATH)
 from src.builders.SQL.SQLCaller import SQL_ETL
 from src.models.kegg import *
 from src.models.go import GOOntologyMeta, GOOntologyRecord, EntrezUniprotMap
@@ -108,22 +109,40 @@ def produce_go_ontology(go_caller: GO_ETL) -> Optional[GOOntologyRecord]:
     return GOOntologyRecord(graph=graph, metadata=metadata)
 
 
-def produce_entrez_uniprot_map(uniprot_caller: UniProt_ETL) -> Optional[Iterator[EntrezUniprotMap]]:
+def produce_entrez_uniprot_map(uniprot_caller: UniProt_ETL,
+                               use_cached: bool = False) -> Optional[Iterator[EntrezUniprotMap]]:
     """
     Downloads the latest UniProt idmapping file, skipping entirely if the
     HTTP cache says it's unchanged (returns None in that case). Otherwise
     streams EntrezUniprotMap records parsed straight off disk -- the file's
     own batch_size (how many lines get buffered while parsing) is independent
     of whatever batch size the consumer stages/upserts with.
+
+    use_cached parses the file already on disk even when nothing was
+    downloaded. The download cache tracks the file; dbo.EntrezUniprotMap
+    lives in a database. Those come apart whenever a new gene_database is
+    pointed at an already-downloaded file, and without this the table could
+    never be populated -- the fetch would decline, this would return None,
+    and the caller would skip, forever. Returns None only if the file is
+    genuinely not on disk.
     """
     downloaded = uniprot_caller.fetch_latest_idmapping()
-    if not downloaded:
+    if not downloaded and not (use_cached and LOCAL_IDMAPPING_PATH.exists()):
         return None
 
+    # Deduped, because the staging insert guards each row with a NOT EXISTS
+    # subquery and the file does repeat pairs. A set here is far cheaper than
+    # making SQL Server prove uniqueness 40k times.
+    #
+    # Order does not matter: EntrezUniprotMap is SnapshotSync, so every row
+    # lands in staging and dbo is replaced in a single swap at the end. There
+    # is no per-batch MERGE whose outcome could depend on how rows are grouped.
+    pairs = {(int(entrez_id), uniprot_id)
+             for batch in uniprot_caller.read_entrez_uniprot_map()
+             for entrez_id, uniprot_id in batch}
     return (
-        EntrezUniprotMap(entrez_id=int(entrez_id), uniprot_id=uniprot_id)
-        for batch in uniprot_caller.read_entrez_uniprot_map()
-        for entrez_id, uniprot_id in batch
+        EntrezUniprotMap(entrez_id=entrez_id, uniprot_id=uniprot_id)
+        for entrez_id, uniprot_id in pairs
     )
 
 
@@ -152,6 +171,35 @@ def produce_gene_uniprot_annotations(sql_caller: SQL_ETL, batch_size: int = 100)
         yield [
             {"id": str(entrez_id), "uniprot_ids": sorted(uniprot_ids)}
             for entrez_id, uniprot_ids in grouped.items()
+        ]
+
+
+def produce_gene_entrez_annotations(sql_caller: SQL_ETL, batch_size: int = 100) -> Iterator[list[dict]]:
+    """
+    The inverse of produce_gene_uniprot_annotations, for accession-keyed
+    Gene nodes (Reactome). Streams each accession's full current entrez_id
+    list from dbo.EntrezUniprotMap, batch_size distinct accessions at a
+    time, grouping on uniprot_id instead of entrez_id so fetch_grouped's
+    "a group is never split across batches" guarantee applies to the
+    column actually being grouped.
+
+    Yields the whole map, not just the accessions currently in the graph.
+    annotate_gene_entrez_ids MATCHes, so rows for accessions that are not
+    Gene nodes cost a failed match and nothing else -- far cheaper than
+    joining to dbo.entities here, and it means a gene synced after this
+    last ran still picks up its qualifier on the next run.
+
+    A full resync rather than a diff-driven one, for the same reason
+    produce_gene_uniprot_annotations is: see its docstring.
+    """
+    for batch in sql_caller.sql_state.fetch_grouped('EntrezUniprotMap', 'uniprot_id', batch_size):
+        grouped: dict[str, list[str]] = {}
+        for row in batch:
+            grouped.setdefault(row['uniprot_id'], []).append(str(row['entrez_id']))
+
+        yield [
+            {"id": uniprot_id, "entrez_ids": sorted(entrez_ids)}
+            for uniprot_id, entrez_ids in grouped.items()
         ]
 
 

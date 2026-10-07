@@ -201,6 +201,55 @@ class DefaultSync(SyncStrategy):
         return ""
 
 @dataclass(frozen=True)
+class SnapshotSync(SyncStrategy):
+    """
+    Full-snapshot reference data: the source hands over the entire table
+    every time, so the production table is REPLACED rather than reconciled.
+
+    This is the right strategy whenever a load is authoritative for the whole
+    table rather than for some scope within it. dbo.EntrezUniprotMap is the
+    case in point -- it is UniProt's idmapping file and nothing else, never
+    assembled from per-pathway parses, so there is no partial state a MERGE
+    could preserve and nothing a diff could tell anyone.
+
+    Reconciling such a table is not merely wasted work, it is actively
+    wrong. EntrezUniprotMap was CompositeKeySync with
+    coverage_scope_columns=("entrez_id",), whose DELETE clause assumes
+    staging holds every row for each scope value it mentions. Row-count
+    batching broke that assumption -- the file is ordered by accession, so
+    one entrez id's accessions landed in different batches and each later
+    batch's MERGE deleted what an earlier one had written. 45% of the pairs
+    were lost with no error, and the distinct-entrez count stayed exactly
+    right, which is what kept it hidden.
+
+    A replace cannot fail that way at any batch size, because batching now
+    only governs how rows reach staging and staging carries no delete
+    semantics at all. There is no coverage scope to get wrong.
+
+    No diff table: see TableManager.create_diff_table.
+    """
+
+    def match_clause(self, schema, target_table: str) -> str:
+        raise NotImplementedError(
+            f"{target_table}: SnapshotSync replaces the table outright and "
+            "never builds a MERGE (see SQLSnapshotReplace.upsert_data)."
+        )
+
+    def diff_output_clause(self, schema, target_table: str, run_id: str) -> str:
+        raise NotImplementedError(
+            f"{target_table}: SnapshotSync has no diff table."
+        )
+
+    def dedup_match_columns(self, schema) -> tuple[str, ...]:
+        if isinstance(schema.key, PrimaryCompositeKey):
+            return schema.key.columns
+        assert schema.key is not None, (
+            "SnapshotSync needs a key or PrimaryCompositeKey to dedup staging on"
+        )
+        return (schema.key,)
+
+
+@dataclass(frozen=True)
 class DeferredResolution:
     match_columns: tuple[str, ...]
     staging_columns: tuple[str, ...]

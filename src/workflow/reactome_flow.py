@@ -144,28 +144,6 @@ def _rows(state, table: str, where: dict | None = None) -> list[dict]:
     return fetch_rows(state, table, kind="dbo", where=where)
 
 
-def fetch_diff_annotated(state, table: str, batch_size: int = 5000) -> Iterator[list[dict]]:
-    """Changed rows of a keyed table, with their columns.
-
-    A DiffSync diff stores the key and the action, never the changed
-    columns, so the diff alone cannot annotate anything -- GeneData's diff
-    is [run_id, action, uniprot_id]. The values come from production,
-    matched on that table's own key, which is why fetch_diff_entities
-    cannot do this job: it joins on entity_id and none of these tables
-    have one.
-    """
-    key = table_schemas[table].key
-    if not isinstance(key, str):
-        raise ValueError(f"{table} has a composite key; annotate it explicitly")
-    changed = {r[key] for r in fetch_rows(state, table, kind="diff")
-               if r.get("action") != "DELETE"}
-    if not changed:
-        return
-    rows = [r for r in fetch_rows(state, table, kind="dbo") if r.get(key) in changed]
-    for i in range(0, len(rows), batch_size):
-        yield rows[i:i + batch_size]
-
-
 def fetch_diff_batches(state, table: str, batch_size: int = 5000) -> Iterator[list[dict]]:
     """Changed edge rows, batched, straight out of the diff table.
 

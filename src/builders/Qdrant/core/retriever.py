@@ -15,9 +15,11 @@ found. It also carries the shortlist filter and the group_by below, neither of
 which can read a point id.
 
 `entrez_id` comes back on record lookups when the store was built with a
-mapping. It is the key back to Neo4j, where annotations live at gene
-granularity, and it is deliberately not unique here -- several isoforms of one
-gene are several records, with genuinely different function text.
+mapping, as a LIST -- one accession can carry several entrez ids. It is a
+second lookup key and the join back to Neo4j Gene nodes, and it is
+deliberately not unique across records either: several isoforms of one gene
+are several records, with genuinely different function text. Roughly 5% of
+accessions have no entrez id at all and omit the field.
 
 Search modes
 ------------

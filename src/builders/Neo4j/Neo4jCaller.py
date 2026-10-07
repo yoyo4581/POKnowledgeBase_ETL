@@ -173,6 +173,50 @@ class Neo4j_ETL:
             SET g.uniprot_ids = row.uniprot_ids
         """, rows=rows)
 
+    @staticmethod
+    def _set_gene_entrez_ids(tx, rows) -> int:
+        # Returns nodes actually MATCHED, not rows sent. The map covers every
+        # accession UniProt knows (~40k); only the ones that are Gene nodes
+        # here (~10k) can match, and MATCH skips the rest silently. Counting
+        # len(rows) would report the size of the input file no matter how
+        # many genes were really annotated -- including zero.
+        result = tx.run("""
+            UNWIND $rows AS row
+            MATCH (g:Gene {id: row.id})
+            SET g.entrez_ids = row.entrez_ids
+            RETURN count(g) AS matched
+        """, rows=rows)
+        return result.single()["matched"]
+
+    def annotate_gene_entrez_ids(self, rows: Sequence[dict], batch_size: int = 5000) -> dict:
+        """
+        The accession-keyed mirror of annotate_gene_uniprot_ids, for sources
+        that key Gene nodes on the UniProt accession (Reactome). Matches a
+        Gene by accession and sets its full current entrez_ids list.
+
+        A list, not a scalar: 46 of the accessions in this corpus map to more
+        than one entrez id, and picking one of them arbitrarily would make a
+        gene unreachable by the id that lost. Genes with no entrez mapping at
+        all (~5% of the corpus) simply never appear in rows and keep no
+        entrez_ids property -- absence is the honest answer there.
+
+        MATCH, not MERGE, for the same reason as annotate_gene_uniprot_ids:
+        this patches a property onto structure that already exists and must
+        never be what creates a Gene node.
+        """
+        if not rows:
+            return {"gene_entrez_ids_annotated": 0, "rows_offered": 0}
+
+        total = 0
+        offered = 0
+        with self.driver.session() as session:
+            for chunk in batched(rows, batch_size):
+                total += session.execute_write(self._set_gene_entrez_ids, chunk)
+                offered += len(chunk)
+                logger.info("annotate_gene_entrez_ids: %d gene(s) annotated from %d row(s) so far",
+                            total, offered)
+        return {"gene_entrez_ids_annotated": total, "rows_offered": offered}
+
     def annotate_gene_uniprot_ids(self, rows: Sequence[dict], batch_size: int = 5000) -> dict:
         """
         Sets each Gene's full current uniprot_ids list, matched by entrez id

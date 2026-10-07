@@ -12,7 +12,8 @@ build_dataset's steps 2-4 in Cypher instead:
 
 One thing Cypher alone cannot do: len(pos[t]) counts UniProt *accessions*, not
 genes. extract() expands every gene-level annotation onto every accession under
-that gene via dbo.EntrezUniprotMap, and drops genes with no function text -- both
+that gene via dbo.EntrezUniprotMap (KEGG) or the identity (Reactome), and
+    drops genes with no function text -- both
 live in SQL. So the counts come out on the wrong scale in two directions at once:
 too low (genes with no mapped accession in FunctionData still counted) and too
 high or low per gene (an isoform-rich gene contributes N, not 1).
@@ -157,17 +158,19 @@ def params(cfg: Config) -> dict:
 
 def gene_weights() -> dict[str, int]:
     """
-    entrez_id -> how many of its UniProt accessions have function text.
+    Gene.id -> how many of its UniProt accessions have function text.
 
     This is exactly the multiplier extract() applies: each gene-level annotation
-    is expanded onto every accession in entrez_to_uniprots[gene], and that map is
-    built only from accessions present in dbo.FunctionData.
+    is expanded onto every accession in gene_to_accessions[gene], and that map is
+    built only from accessions present in dbo.FunctionData. Under a source that
+    keys genes by accession (Reactome) every weight is 1 by construction, and
+    this probe reports a flat distribution rather than nothing.
     """
     from EmbeddingModel.BioBERT_Files.dataset import _load_protein_data
     from src.builders.SQL.SQLCaller import SQL_ETL
 
-    entrez_to_uniprots, protein_rows = _load_protein_data(SQL_ETL())
-    weights = {gene: len(accessions) for gene, accessions in entrez_to_uniprots.items()}
+    gene_to_accessions, protein_rows = _load_protein_data(SQL_ETL())
+    weights = {gene: len(accessions) for gene, accessions in gene_to_accessions.items()}
     multi = sum(1 for n in weights.values() if n > 1)
     print(f"  {len(protein_rows)} accessions with function text across {len(weights)} genes "
           f"({multi} of them with more than one accession)")

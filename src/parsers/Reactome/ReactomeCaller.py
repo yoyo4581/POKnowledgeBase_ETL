@@ -47,6 +47,30 @@ MEMBERSHIP_SLOTS = ("hasComponent", "hasMember", "hasCandidate", "repeatedUnit")
 CHEMICAL_CLASSES = frozenset({"SimpleEntity", "ChemicalDrug", "ProteinDrug",
                               "RNADrug", "Polymer"})
 
+# An accession is only unique inside its own database. Reactome's drugs alone
+# span eight of them, and the namespaces overlap: ChEBI 47499 is imipramine
+# while PubChem 47499 is latamoxef, so a bare id makes them one node.
+# Genes are deliberately exempt -- a UniProt accession is globally unique, and
+# GO annotation, FunctionData and the Qdrant corpus all key on the bare value.
+SOURCE_PREFIX = {
+    "chebi": "chebi",
+    "guide to pharmacology": "gtp",
+    "guide to pharmacology - ligands": "gtp",
+    "pubchem compound": "pubchem",
+    "pubchem substance": "pubchemsub",
+}
+
+
+def _namespaced(database_name: str, identifier: str) -> str:
+    """`<source>:<accession>`.
+
+    An unmapped database gets a slug of its own name rather than falling
+    back to the bare accession, so a source we have not seen cannot
+    silently join the shared number space.
+    """
+    slug = SOURCE_PREFIX.get(database_name) or re.sub(r"[^a-z0-9]", "", database_name)
+    return f"{slug or 'unknown'}:{identifier}"
+
 
 class _RateLimiter:
     """Caps the combined request rate across every thread sharing one
@@ -219,9 +243,12 @@ def _residue_moieties(residue: dict) -> list[dict]:
         elif str(stid).startswith("chebi:") and m.get("identifier"):
             # A chemical one is a ReferenceMolecule. Every ReferenceEntity
             # stId is '<prefix>:<accession>' and never R-, so these are not
-            # entities to walk; the node is the compound keyed on the bare
-            # accession, exactly as a SimpleEntity's compound is.
-            out.append({"modification": m["identifier"], "ref": m, "psi_mod": psi_mod})
+            # entities to walk; the node is the compound, keyed the same way
+            # a SimpleEntity's compound is -- namespaced, not bare, or the
+            # moiety and the compound become two different nodes.
+            cid = _namespaced("chebi", m["identifier"])
+            out.append({"modification": cid, "ref": {**m, "identifier": cid},
+                        "psi_mod": psi_mod})
         else:
             logger.warning("moiety modification %r is neither a Reactome entity "
                            "nor a ChEBI reference - skipped", stid)
@@ -596,7 +623,8 @@ class Reactome_ETL:
                   or obj.get("schemaClass") in CHEMICAL_CLASSES):
                 kind = EntityType.DRUG if obj.get("schemaClass", "").endswith("Drug") \
                     else EntityType.COMPOUND
-                reference_id = identifier
+                reference_id = _namespaced(db, identifier)
+                ref = {**ref, "identifier": reference_id}
             else:
                 # A DNA or RNA entity. Reactome keys those on Ensembl, and
                 # only the protein carries a UniProt accession.

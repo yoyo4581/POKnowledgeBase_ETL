@@ -60,6 +60,12 @@ class Gene(_EntityLabelled, BaseNeo4jNode):
     # Reactome-keyed node IS its accession, so the list is [id] and GO
     # annotation keeps working without touching OntologyState.
     uniprot_ids: list[str] = field(default_factory=list)
+    # entrez_ids is deliberately NOT a field here. It is an annotation
+    # property, written only by entrez_uniprot_annotation from
+    # dbo.EntrezUniprotMap, on its own (monthly) cadence. A field would be
+    # worse than redundant: to_row() drops None but keeps [], so every
+    # structural upsert of a Gene would SET entrez_ids = [] and silently
+    # erase the qualifier until the annotation DAG ran again.
     __label__: ClassVar[str] = "Gene"
     __column_map__: ClassVar[dict[str, str]] = {"uniprot_id": "id", "gene_name": "name"}
 

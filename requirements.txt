@@ -65,4 +65,4 @@ accelerate==1.15.0
 
 # --- notebooks and plots --------------------------------------------------
 matplotlib==3.11.1            # train.py's plot_training_history
-ipykernel==7.3.0              # tester.ipynb, stage_upsert_tester.ipynb
+ipykernel==7.3.0              # notebooks/

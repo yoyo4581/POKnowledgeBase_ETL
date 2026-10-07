@@ -18,9 +18,13 @@ services:
     image: qdrant/qdrant:v1.19.1
     container_name: qdrant
     restart: unless-stopped
+    # 127.0.0.1-bound on purpose. A bare "6333:6333" publishes on 0.0.0.0 --
+    # every interface, including the LAN -- which with no API key means an
+    # unauthenticated store anyone routable can read and write. Prefixing the
+    # host IP is what actually makes the "localhost only" claim below true.
     ports:
-      - "6333:6333"   # REST -- core.config.open_client uses prefer_grpc=False
-      - "6334:6334"   # gRPC, for anything that wants it later
+      - "127.0.0.1:${QDRANT_REST_PORT:-6333}:6333"   # REST -- open_client uses prefer_grpc=False
+      - "127.0.0.1:${QDRANT_GRPC_PORT:-6334}:6334"   # gRPC, for anything that wants it later
     volumes:
       # A named volume, not a bind mount into data/. The collections are
       # reproducible from qdrant_export/ via `store.py restore`, so this is a
@@ -32,8 +36,9 @@ services:
       # Structured logs, so an alias flip during restore_to_server is greppable.
       QDRANT__LOG_LEVEL: INFO
       QDRANT__SERVICE__ENABLE_TLS: "false"
-      # No API key: this listens on localhost only. If you ever publish the port,
-      # set QDRANT__SERVICE__API_KEY here and QDRANT_API_KEY in .env to match --
+      # No API key, which is only safe because the ports above are bound to
+      # 127.0.0.1. If you ever widen those to 0.0.0.0, set
+      # QDRANT__SERVICE__API_KEY here and QDRANT_API_KEY in .env to match --
       # the DAG already reads the latter and passes it to open_client().
     healthcheck:
       # /readyz rather than /healthz: healthz answers as soon as the process is
@@ -44,6 +49,62 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+
+  # --- one-shot: recover collections from shipped snapshots -----------------
+  #
+  #     docker compose --profile load run --rm qdrant-load
+  #
+  # The Qdrant counterpart to neo4j-load, and the reason a consumer needs no
+  # Python: ship data/qdrant/snapshots/*.snapshot next to the compose file and
+  # this restores them over the API. Unlike neo4j-load the server stays UP --
+  # Qdrant recovers into a live server, so there is no stop/start dance.
+  #
+  # Re-runnable: recover replaces the collection, so refreshing a consumer's
+  # data is this command again rather than `down -v`. That is strictly better
+  # than the boot-time `--snapshot` flag, which is ignored once the storage
+  # volume already holds the collection.
+  #
+  # To PRODUCE a snapshot, use qdrant_collection_build's snapshot_collections
+  # task, or by hand from the host:
+  #   curl -X POST localhost:6333/collections/<name>/snapshots
+  #   curl -O localhost:6333/collections/<name>/snapshots/<returned-name>
+  # There is no dump profile here, unlike neo4j-dump: producing happens on the
+  # machine that has the repo, while loading must work with Docker alone.
+  #
+  # NOTE these land as REAL collections on the logical names. That is correct
+  # for a fresh install but would block the alias on a host that runs
+  # qdrant_collection_build -- see restore_to_server, which refuses in exactly
+  # that case. Do not run this on the ETL host.
+  qdrant-load:
+    profiles: ["load"]
+    image: curlimages/curl:8.11.1
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      # The shipped snapshots. Read-only, and mounted HERE rather than on the
+      # server, because the upload reads the file client-side. The directory
+      # must EXIST before `up`: Docker creates a missing bind source as root,
+      # and then nothing but root can write into it.
+      - ./data/qdrant/snapshots:/snapshots:ro
+    entrypoint: ["/bin/sh", "-c"]
+    # One physical line. A YAML folded scalar (>) only joins lines at a UNIFORM
+    # indent -- indent a continuation further and the newline is kept literal,
+    # which would hand /bin/sh `-H 'Content-Type...'` as its own command.
+    # Uploaded as multipart, NOT recovered from a file:// location. Qdrant
+    # refuses (403) a file:// path outside its own configured snapshots
+    # directory, so that route would force the server to bind-mount this
+    # directory read-write and then write root-owned 0600 files into the repo
+    # tree. Uploading keeps the mount here, on the throwaway loader, read-only.
+    # priority=snapshot makes the snapshot's data win over whatever is already
+    # in the collection, which is the point of a restore.
+    #
+    # Picks the NEWEST <collection>-v<timestamp>.snapshot. The version is
+    # YYYYMMDDHHMMSS, so plain lexicographic sort is time order -- no date
+    # parsing in sh. To roll back, delete the newest file and re-run; to pin a
+    # specific build, leave only that one in the directory.
+    command:
+      - 'for c in function_records function_chunks; do f=$$(ls -1 /snapshots/$$c-v*.snapshot 2>/dev/null | sort | tail -1); if [ -z "$$f" ]; then echo "no $$c-v*.snapshot in /snapshots"; exit 1; fi; echo "uploading $$f -> $$c"; curl -fsS -X POST "http://qdrant:6333/collections/$$c/snapshots/upload?priority=snapshot" -F "snapshot=@$$f" || exit 1; echo; done'
 
   # --- Neo4j: the serving replica of the graph the ETL builds ---------------
   #
@@ -57,19 +118,34 @@ services:
     image: neo4j:5.19.0-community
     container_name: neo4j
     restart: unless-stopped
+    # Loopback-only, same reasoning as Qdrant above -- doubly so with auth
+    # disabled. Every user runs their own copy, so the defaults are the plain
+    # ports a fresh machine expects.
+    #
+    # Override only where something already owns them. On the ETL host Neo4j
+    # Desktop holds 7687 -- that is where the ETL writes, and STOP DATABASE
+    # during a dump stops the database, not the listener, so it stays taken
+    # for the whole dump. There, set NEO4J_BOLT_PORT=7688 and a matching
+    # NEO4J_CONTAINER_URI in .env rather than editing this file.
     ports:
-      - "7474:7474"   # HTTP / Browser
-      - "7687:7687"   # Bolt -- point NEO4J_URI at bolt://localhost:7687
+      - "127.0.0.1:${NEO4J_HTTP_PORT:-7474}:7474"   # HTTP / Browser
+      - "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"   # Bolt
     volumes:
       - neo4j_data:/data      # <- the database itself. This is the persistence.
       - neo4j_logs:/logs
       - ./data/neo4j/dumps:/dumps    # where the snapshot DAG drops neo4j.dump
     environment:
-      # Only applied when /data is EMPTY. Once the volume has a system database,
-      # this is ignored and the password is whatever it already was -- including
-      # after a dump load, since the dump covers the `neo4j` database and not
-      # `system`. Change it here before the first start, not after.
-      NEO4J_AUTH: neo4j/${NEO4J_CONTAINER_PASSWORD:-changeme-before-first-start}
+      # Auth off. Defensible ONLY because the ports above are 127.0.0.1-bound:
+      # nothing off this machine can reach Bolt or the Browser. Note this has
+      # no bearing on the Desktop instance the ETL writes to, which keeps its
+      # own password -- the two servers share no credentials.
+      #
+      # Only applied when /data is EMPTY. Once the volume has a system database
+      # this is ignored, including after a dump load, since the dump covers the
+      # `neo4j` database and not `system`. Change it before the first start, or
+      # not at all -- afterwards it takes `neo4j-admin dbms set-initial-password`
+      # or a volume wipe.
+      NEO4J_AUTH: none
       # Community, not Enterprise -- no licence to accept. Confirmed viable:
       # the source store is record-aligned-1.1 (db.format=aligned), which both
       # editions read, and every constraint is plain UNIQUENESS. Had Desktop
@@ -122,7 +198,15 @@ services:
   #     docker compose start neo4j
   #
   # Once the ETL writes to this container rather than to Desktop, this is what
-  # the snapshot DAG calls on neo4j://kgml_complete. Enterprise also has
+  # the snapshot DAG calls on neo4j://kgml_complete.
+  #
+  # PERMISSIONS, the same trap neo4j_snapshot.dump_source hit: the entrypoint
+  # runs neo4j-admin as uid 7474, and ./data/neo4j/dumps is owned by whoever
+  # cloned the repo, so the dump fails with "AccessDeniedException: /dumps".
+  # The DAG solves it with --user $(id -u):$(id -g) because it reads Desktop's
+  # store off /mnt/c, which is that user's own files. This service cannot copy
+  # that: it reads the neo4j_data volume, which belongs to 7474. Make the host
+  # directory group- or world-writable before using this path. Enterprise also has
   # `neo4j-admin database backup`, which runs against a LIVE server over port
   # 6362 and needs no stop at all -- prefer that if you keep the Enterprise
   # licence on the SOURCE. Community cannot online-backup, hence the stop.

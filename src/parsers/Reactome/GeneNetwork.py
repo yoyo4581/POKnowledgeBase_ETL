@@ -21,11 +21,16 @@ from src.models.reactome import (
 
 # Cosubstrates: consumed, never attached, so `moieties` cannot find them.
 # Cofactors that identify an enzyme (haem, FAD, Fe-S) are deliberately absent.
+# Namespaced to match the compound ids the parser emits: an accession is
+# only unique inside its database, so a bare "30616" no longer identifies
+# ATP anywhere in the graph.
 CURRENCY_CHEBI = frozenset({
-    "15377", "15378", "29888",              # H2O, H+, OH-
-    "30616", "456216", "43474", "33019",    # ATP, ADP, Pi, PPi
-    "16526", "15379",                       # CO2, O2
-    "57540", "57945", "58349", "57783",     # NAD(H), NADP(H)
+    "chebi:15377", "chebi:15378", "chebi:29888",        # H2O, H+, OH-
+    "chebi:30616", "chebi:456216",                      # ATP, ADP
+    "chebi:43474", "chebi:33019",                       # Pi, PPi
+    "chebi:16526", "chebi:15379",                       # CO2, O2
+    "chebi:57540", "chebi:57945",                       # NAD(H)
+    "chebi:58349", "chebi:57783",                       # NADP(H)
 })
 
 # ("Gene", "P04637") | ("Compound", "29654") | ("Entity", "R-HSA-6799192")
